@@ -1,18 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-app.py - Version ultra-simple SANS gunicorn ni requirements.txt
-Utilise uniquement les bibliothèques standard de Python
-"""
-
 from flask import Flask, request, jsonify, render_template_string, redirect
 import os
 import json
-import urllib.request
-import urllib.parse
+import requests
 import csv
 import io
-import re
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
@@ -28,117 +19,30 @@ clients_database = {}
 upload_stats = {
     "total_clients": 0,
     "last_upload": None,
-    "filename": None,
-    "banks_detected": 0,
-    "detection_rate": 0
+    "filename": None
 }
-
-class BankDetector:
-    """Classe pour détecter le nom de la banque à partir de l'IBAN français"""
-    
-    def __init__(self):
-        self.bank_codes = {
-            '30002': 'Crédit Lyonnais (LCL)',
-            '30003': 'Crédit Agricole',
-            '30004': 'BNP Paribas',
-            '30006': 'Société Générale',
-            '20041': 'Banque Populaire',
-            '42559': 'Crédit Mutuel',
-            '10278': 'Crédit Mutuel Arkéa',
-            '16958': 'La Banque Postale',
-            '20817': 'HSBC France',
-            '30056': 'Caisse d\'Épargne',
-            '16967': 'Hello Bank (BNP Paribas)',
-            '18206': 'Fortuneo',
-            '19138': 'BforBank (Crédit Agricole)',
-            '20395': 'ING Direct',
-            '16586': 'Revolut',
-            '14437': 'N26',
-            '17515': 'CIC',
-            '30027': 'Crédit du Nord',
-            '13135': 'Crédit Coopératif',
-            '27052': 'BRED',
-            '30788': 'Natixis',
-            '18327': 'Axa Banque'
-        }
-    
-    def extract_bank_code(self, iban):
-        """Extrait le code banque de l'IBAN français"""
-        if not iban or not isinstance(iban, str):
-            return None
-            
-        clean_iban = re.sub(r'\s+', '', iban.upper())
-        
-        if not re.match(r'^FR\d{2}\d{10,}', clean_iban):
-            return None
-            
-        try:
-            bank_code = clean_iban[4:9]
-            return bank_code if bank_code.isdigit() else None
-        except IndexError:
-            return None
-    
-    def detect_bank(self, iban):
-        """Détecte le nom de la banque à partir de l'IBAN"""
-        bank_code = self.extract_bank_code(iban)
-        
-        if not bank_code:
-            return None, None
-            
-        if bank_code in self.bank_codes:
-            return self.bank_codes[bank_code], bank_code
-            
-        for code, name in self.bank_codes.items():
-            if bank_code.startswith(code[:3]):
-                return f"{name} (code approx.)", bank_code
-                
-        return f"Banque inconnue (code: {bank_code})", bank_code
-
-# Instance globale du détecteur de banques
-bank_detector = BankDetector()
-
-def detect_and_add_bank_info(client_data):
-    """Détecte automatiquement la banque à partir de l'IBAN"""
-    iban = client_data.get('iban', '')
-    
-    if iban and iban != 'N/A':
-        bank_name, bank_code = bank_detector.detect_bank(iban)
-        
-        if bank_name:
-            client_data['banque_detectee'] = bank_name
-            client_data['code_banque'] = bank_code or ''
-            
-            if not client_data.get('banque') or client_data.get('banque') == 'N/A':
-                client_data['banque'] = bank_name
-        else:
-            client_data['banque_detectee'] = 'Non détectée'
-            client_data['code_banque'] = ''
-    else:
-        client_data['banque_detectee'] = 'Pas d\'IBAN'
-        client_data['code_banque'] = ''
-    
-    return client_data
 
 def load_clients_from_csv(file_content):
     """Charge les clients depuis un contenu CSV"""
     global clients_database, upload_stats
     
     clients_database = {}
-    banks_detected = 0
     
+    # Lecture CSV avec gestion des erreurs
     try:
+        # Utilisation du module csv de Python
         csv_reader = csv.DictReader(io.StringIO(file_content))
         
         for row in csv_reader:
-            # Normalisation des clés
+            # Normalisation des clés (lowercase et strip)
             normalized_row = {}
             for key, value in row.items():
-                if key:
+                if key:  # Éviter les clés None
                     normalized_row[key.lower().strip()] = str(value).strip() if value else ""
             
             # Recherche colonne téléphone
             telephone = None
-            tel_columns = ['telephone', 'tel', 'phone', 'numero', 'number', 'mobile', 'n° mobile']
+            tel_columns = ['telephone', 'tel', 'phone', 'numero', 'number', 'mobile']
             for tel_key in tel_columns:
                 if tel_key in normalized_row and normalized_row[tel_key]:
                     telephone = normalized_row[tel_key]
@@ -148,58 +52,51 @@ def load_clients_from_csv(file_content):
                 continue
                 
             # Normalisation du numéro
-            telephone = telephone.replace(' ', '').replace('.', '').replace('-', '')
+            telephone = telephone.replace(' ', '').replace('.', '').replace('-', '').replace('(', '').replace(')', '')
             if telephone.startswith('+33'):
                 telephone = '0' + telephone[3:]
             elif telephone.startswith('33') and len(telephone) > 10:
                 telephone = '0' + telephone[2:]
             
             if len(telephone) >= 10 and telephone.startswith('0'):
-                client_data = {
+                clients_database[telephone] = {
+                    # Informations de base
                     "nom": normalized_row.get('nom', ''),
                     "prenom": normalized_row.get('prenom', ''),
                     "email": normalized_row.get('email', ''),
                     "entreprise": normalized_row.get('entreprise', ''),
                     "telephone": telephone,
+                    
+                    # Adresse
                     "adresse": normalized_row.get('adresse', ''),
                     "ville": normalized_row.get('ville', ''),
                     "code_postal": normalized_row.get('code_postal', ''),
+                    
+                    # Informations bancaires
                     "banque": normalized_row.get('banque', ''),
                     "swift": normalized_row.get('swift', ''),
                     "iban": normalized_row.get('iban', ''),
+                    
+                    # Informations personnelles
                     "sexe": normalized_row.get('sexe', ''),
                     "date_naissance": normalized_row.get('date_naissance', 'Non renseigné'),
                     "lieu_naissance": normalized_row.get('lieu_naissance', 'Non renseigné'),
                     "profession": normalized_row.get('profession', ''),
                     "nationalite": normalized_row.get('nationalite', ''),
                     "situation_familiale": normalized_row.get('situation_familiale', ''),
+                    
+                    # Gestion campagne
                     "statut": normalized_row.get('statut', 'Prospect'),
                     "date_upload": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     "nb_appels": 0,
                     "dernier_appel": None,
                     "notes": ""
                 }
-                
-                # Détection banque
-                client_data = detect_and_add_bank_info(client_data)
-                
-                if client_data.get('banque_detectee') and client_data['banque_detectee'] not in ['Non détectée', 'Pas d\'IBAN']:
-                    banks_detected += 1
-                
-                clients_database[telephone] = client_data
         
-        total_clients = len(clients_database)
-        detection_rate = (banks_detected / total_clients * 100) if total_clients > 0 else 0
-        
-        upload_stats["total_clients"] = total_clients
-        upload_stats["banks_detected"] = banks_detected
-        upload_stats["detection_rate"] = round(detection_rate, 1)
+        upload_stats["total_clients"] = len(clients_database)
         upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
-        print(f"✅ {total_clients} clients chargés depuis CSV")
-        print(f"🏦 {banks_detected} banques détectées ({detection_rate:.1f}%)")
-        
-        return total_clients
+        return len(clients_database)
         
     except Exception as e:
         print(f"Erreur lecture CSV: {str(e)}")
@@ -208,7 +105,7 @@ def load_clients_from_csv(file_content):
 def get_client_info(phone_number):
     """Récupère les infos client depuis la base chargée"""
     # Normalisation du numéro entrant
-    normalized_number = phone_number.replace(' ', '').replace('.', '').replace('-', '')
+    normalized_number = phone_number.replace(' ', '').replace('.', '').replace('-', '').replace('(', '').replace(')', '')
     if normalized_number.startswith('+33'):
         normalized_number = '0' + normalized_number[3:]
     elif normalized_number.startswith('33') and len(normalized_number) > 10:
@@ -217,11 +114,12 @@ def get_client_info(phone_number):
     # Recherche exacte
     if normalized_number in clients_database:
         client = clients_database[normalized_number].copy()
+        # Mise à jour statistiques
         clients_database[normalized_number]["nb_appels"] += 1
         clients_database[normalized_number]["dernier_appel"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         return client
     
-    # Recherche partielle
+    # Recherche partielle (derniers 9 chiffres)
     if len(normalized_number) >= 9:
         suffix = normalized_number[-9:]
         for tel, client in clients_database.items():
@@ -242,8 +140,6 @@ def get_client_info(phone_number):
         "code_postal": "N/A",
         "telephone": phone_number,
         "banque": "N/A",
-        "banque_detectee": "N/A",
-        "code_banque": "",
         "swift": "N/A",
         "iban": "N/A",
         "sexe": "N/A",
@@ -260,7 +156,7 @@ def get_client_info(phone_number):
     }
 
 def send_telegram_message(message):
-    """Envoie un message vers Telegram en utilisant urllib"""
+    """Envoie un message vers Telegram"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {
@@ -268,27 +164,16 @@ def send_telegram_message(message):
             'text': message,
             'parse_mode': 'HTML'
         }
-        
-        # Utilisation urllib au lieu de requests
-        data_encoded = urllib.parse.urlencode(data).encode('utf-8')
-        req = urllib.request.Request(url, data=data_encoded, method='POST')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = response.read().decode('utf-8')
-            return json.loads(result)
-            
+        response = requests.post(url, data=data, timeout=10)
+        return response.json()
     except Exception as e:
         print(f"❌ Erreur Telegram: {str(e)}")
         return None
 
 def format_client_message(client_info, context="appel"):
     """Formate un message client pour Telegram"""
-    banque_detectee = client_info.get('banque_detectee', 'N/A')
-    bank_emoji = "🏦✅" if banque_detectee and banque_detectee not in ['N/A', 'Non détectée', 'Pas d\'IBAN'] else "🏦❓"
-    
     if context == "appel":
         emoji_statut = "📞" if client_info['statut'] != "Non référencé" else "❓"
-        
         return f"""
 {emoji_statut} <b>APPEL ENTRANT</b>
 📞 Numéro: <code>{client_info['telephone']}</code>
@@ -299,6 +184,7 @@ def format_client_message(client_info, context="appel"):
 ▪️ Prénom: <b>{client_info['prenom']}</b>
 👥 Sexe: {client_info.get('sexe', 'N/A')}
 🎂 Date de naissance: {client_info.get('date_naissance', 'N/A')}
+📍 Lieu de naissance: {client_info.get('lieu_naissance', 'N/A')}
 
 🏢 <b>PROFESSIONNEL</b>
 ▪️ Entreprise: {client_info['entreprise']}
@@ -309,9 +195,9 @@ def format_client_message(client_info, context="appel"):
 ▪️ Adresse: {client_info['adresse']}
 ▪️ Ville: {client_info['ville']} {client_info['code_postal']}
 
-{bank_emoji} <b>INFORMATIONS BANCAIRES</b>
-▪️ Banque détectée: <b>{banque_detectee}</b>
-▪️ Code banque: <code>{client_info.get('code_banque', 'N/A')}</code>
+🏦 <b>INFORMATIONS BANCAIRES</b>
+▪️ Banque: {client_info.get('banque', 'N/A')}
+▪️ SWIFT: <code>{client_info.get('swift', 'N/A')}</code>
 ▪️ IBAN: <code>{client_info.get('iban', 'N/A')}</code>
 
 📊 <b>CAMPAGNE</b>
@@ -319,28 +205,42 @@ def format_client_message(client_info, context="appel"):
 ▪️ Nb appels: {client_info['nb_appels']}
 ▪️ Dernier appel: {client_info['dernier_appel'] or 'Premier appel'}
         """
-    else:
+    else:  # Recherche manuelle
         return f"""
 📋 <b>RÉSULTAT TROUVÉ :</b>
 
 👤 <b>IDENTITÉ</b>
 🙋 Nom : <b>{client_info['nom']}</b>
 👤 Prénom : <b>{client_info['prenom']}</b>
+👥 Sexe : {client_info.get('sexe', 'N/A')}
+🎂 Date de naissance : {client_info.get('date_naissance', 'N/A')}
+📍 Lieu de naissance : {client_info.get('lieu_naissance', 'N/A')}
+🌍 Nationalité : {client_info.get('nationalite', 'N/A')}
+
+🏢 <b>PROFESSIONNEL</b>
+▪️ Entreprise : {client_info['entreprise']}
+▪️ Profession : {client_info.get('profession', 'N/A')}
 📧 Email : {client_info['email']}
 📞 Téléphone : <code>{client_info['telephone']}</code>
 
 🏠 <b>ADRESSE</b>
 ▪️ Adresse : {client_info['adresse']}
-🏘️ Ville : {client_info['ville']} {client_info['code_postal']}
+📮 Code postal : {client_info['code_postal']}
+🏘️ Ville : {client_info['ville']}
 
-{bank_emoji} <b>INFORMATIONS BANCAIRES</b>
-🏛️ Banque détectée : <b>{banque_detectee}</b>
-🔢 Code banque : <code>{client_info.get('code_banque', 'N/A')}</code>
+🏦 <b>INFORMATIONS BANCAIRES</b>
+🏛️ Banque : {client_info.get('banque', 'N/A')}
+💳 SWIFT : <code>{client_info.get('swift', 'N/A')}</code>
 🏦 IBAN : <code>{client_info.get('iban', 'N/A')}</code>
+
+👨‍👩‍👧‍👦 <b>SITUATION</b>
+▪️ Situation familiale : {client_info.get('situation_familiale', 'N/A')}
 
 💼 <b>CAMPAGNE</b>
 ▪️ Statut: <b>{client_info['statut']}</b>
+▪️ Ajouté le: {client_info.get('date_upload', 'N/A')}
 ▪️ Nb appels: {client_info['nb_appels']}
+▪️ Dernier appel: {client_info['dernier_appel'] or 'Jamais appelé'}
         """
 
 def process_telegram_command(message_text, chat_id):
@@ -361,9 +261,6 @@ def process_telegram_command(message_text, chat_id):
 📁 Dernier upload: {upload_stats['last_upload'] or 'Aucun'}
 📋 Fichier: {upload_stats['filename'] or 'Aucun'}
 
-🏦 <b>DÉTECTION BANQUES</b>
-▪️ Banques détectées: {upload_stats.get('banks_detected', 0)} ({upload_stats.get('detection_rate', 0)}%)
-
 📞 <b>APPELS DU JOUR</b>
 ▪️ Clients appelants: {len([c for c in clients_database.values() if c['dernier_appel'] and c['dernier_appel'].startswith(datetime.now().strftime('%d/%m/%Y'))])}
 ▪️ Nouveaux contacts: {len([c for c in clients_database.values() if c['nb_appels'] == 0])}
@@ -376,10 +273,10 @@ def process_telegram_command(message_text, chat_id):
 🤖 <b>COMMANDES DISPONIBLES</b>
 
 📞 <code>/numero 0123456789</code>
-   → Affiche la fiche client complète avec banque détectée
+   → Affiche la fiche client complète
 
 📊 <code>/stats</code>
-   → Statistiques de la campagne et détection banques
+   → Statistiques de la campagne
 
 🆘 <code>/help</code>
    → Affiche cette aide
@@ -387,7 +284,6 @@ def process_telegram_command(message_text, chat_id):
 ✅ <b>Le bot reçoit automatiquement:</b>
 ▪️ Les appels entrants OVH
 ▪️ Les notifications en temps réel
-▪️ La détection automatique des banques par IBAN
             """
             send_telegram_message(help_message)
             return {"status": "help_sent"}
@@ -413,22 +309,30 @@ def ovh_webhook():
             
             print(f"🔔 [{timestamp}] Appel CGI OVH:")
             print(f"📞 Appelant: {caller_number}")
+            print(f"📞 Appelé: {called_number}")
+            print(f"📋 Type: {event_type}")
         else:
             data = request.get_json() or {}
             caller_number = data.get('callerIdNumber', request.args.get('caller', 'Inconnu'))
             call_status = data.get('status', 'incoming')
             
             print(f"🔔 [{timestamp}] Appel JSON:")
+            print(f"📋 Données: {json.dumps(data, indent=2)}")
         
         # Récupération fiche client
         client_info = get_client_info(caller_number)
         
-        # Message Telegram
+        # Message Telegram formaté
         telegram_message = format_client_message(client_info, context="appel")
         telegram_message += f"\n📊 Statut appel: {call_status}"
         
         # Envoi vers Telegram
         telegram_result = send_telegram_message(telegram_message)
+        
+        if telegram_result:
+            print("✅ Message Telegram envoyé")
+        else:
+            print("❌ Échec envoi Telegram")
         
         return jsonify({
             "status": "success",
@@ -437,7 +341,7 @@ def ovh_webhook():
             "method": request.method,
             "telegram_sent": telegram_result is not None,
             "client": f"{client_info['prenom']} {client_info['nom']}",
-            "bank_detected": client_info.get('banque_detectee', 'N/A')
+            "client_status": client_info['statut']
         })
         
     except Exception as e:
@@ -453,6 +357,9 @@ def telegram_webhook():
         if 'message' in data and 'text' in data['message']:
             message_text = data['message']['text']
             chat_id = data['message']['chat']['id']
+            user_name = data['message']['from'].get('first_name', 'Utilisateur')
+            
+            print(f"📱 Commande reçue de {user_name}: {message_text}")
             
             result = process_telegram_command(message_text, chat_id)
             
@@ -474,45 +381,38 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🤖 Webhook OVH-Telegram avec Détection Banques</title>
+    <title>🤖 Webhook OVH-Telegram - Gestion Clients</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
         .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         .header { text-align: center; margin-bottom: 30px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
         .stat-card { background: #e3f2fd; padding: 20px; border-radius: 8px; text-align: center; }
-        .stat-card.bank { background: #e8f5e8; }
         .upload-section { background: #f0f4f8; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
         .btn { background: #2196F3; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 5px; }
         .btn:hover { background: #1976D2; }
+        .btn-danger { background: #f44336; }
         .btn-success { background: #4CAF50; }
+        .links { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
         .success { color: #4CAF50; font-weight: bold; }
+        .error { color: #f44336; font-weight: bold; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
         .info-box { background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 10px 0; }
-        .warning { background: #fff3cd; padding: 15px; border-radius: 8px; margin: 10px 0; color: #856404; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 Webhook OVH-Telegram 🏦</h1>
-            <p class="success">✅ Version Ultra-Simple - Détection automatique des banques</p>
-        </div>
-
-        <div class="warning">
-            <strong>⚡ Version Sans Dépendances :</strong> Cette version utilise uniquement les bibliothèques standard Python pour éviter les problèmes de déploiement Railway.
+            <h1>🤖 Webhook OVH-Telegram</h1>
+            <p class="success">✅ Serveur Railway actif 24/7 - Bot configuré</p>
         </div>
 
         <div class="stats">
             <div class="stat-card">
                 <h3>👥 Clients chargés</h3>
                 <h2>{{ total_clients }}</h2>
-            </div>
-            <div class="stat-card bank">
-                <h3>🏦 Banques détectées</h3>
-                <h2>{{ banks_detected }}</h2>
-                <p>{{ detection_rate }}% détection</p>
             </div>
             <div class="stat-card">
                 <h3>📁 Dernier upload</h3>
@@ -525,13 +425,19 @@ def home():
         </div>
 
         <div class="upload-section">
-            <h2>📂 Upload fichier clients (CSV)</h2>
+            <h2>📂 Upload fichier clients (CSV uniquement)</h2>
             <form action="/upload" method="post" enctype="multipart/form-data">
                 <div class="info-box">
                     <p><strong>📋 Format supporté:</strong> CSV (.csv)</p>
-                    <p><strong>🔥 Colonne obligatoire:</strong> téléphone (telephone, N° Mobile, etc.)</p>
-                    <p><strong>🏦 Détection banque:</strong> IBAN analysé automatiquement</p>
-                    <p><strong>✨ Colonnes supportées:</strong> nom, prenom, email, adresse, ville, iban, etc.</p>
+                    <p><strong>🔥 Colonne obligatoire:</strong> <code>telephone</code> (ou tel, phone, numero)</p>
+                    <p><strong>✨ Colonnes optionnelles:</strong></p>
+                    <ul style="text-align: left; max-width: 800px; margin: 0 auto;">
+                        <li><strong>Identité:</strong> nom, prenom, sexe, date_naissance, lieu_naissance, nationalite</li>
+                        <li><strong>Contact:</strong> email, adresse, ville, code_postal</li>
+                        <li><strong>Professionnel:</strong> entreprise, profession</li>
+                        <li><strong>Bancaire:</strong> banque, swift, iban</li>
+                        <li><strong>Divers:</strong> statut, situation_familiale</li>
+                    </ul>
                 </div>
                 <input type="file" name="file" accept=".csv" required style="margin: 10px 0;">
                 <br>
@@ -539,40 +445,50 @@ def home():
             </form>
         </div>
 
-        <h2>📱 Commandes Telegram</h2>
+        <h2>🔧 Tests & Configuration</h2>
+        <div class="links">
+            <a href="/clients" class="btn">👥 Voir clients</a>
+            <a href="/setup-telegram-webhook" class="btn">⚙️ Config Telegram</a>
+            <a href="/test-telegram" class="btn">📧 Test Telegram</a>
+            <a href="/test-command" class="btn">🎯 Test /numero</a>
+            <a href="/test-ovh-cgi" class="btn">📞 Test appel OVH</a>
+            <a href="/clear-clients" class="btn btn-danger" onclick="return confirm('Effacer tous les clients ?')">🗑️ Vider base</a>
+        </div>
+
+        <h2>🔗 Configuration OVH CTI</h2>
+        <div class="info-box">
+            <p><strong>URL CGI à configurer dans l'interface OVH :</strong></p>
+            <code>https://web-production-95ca.up.railway.app/webhook/ovh?caller=*CALLING*&callee=*CALLED*&type=*EVENT*</code>
+        </div>
+
+        <h2>📱 Commandes Telegram disponibles</h2>
         <ul>
-            <li><code>/numero 0123456789</code> - Fiche client avec banque détectée</li>
-            <li><code>/stats</code> - Statistiques campagne</li>
-            <li><code>/help</code> - Aide</li>
+            <li><code>/numero 0123456789</code> - Affiche fiche client complète</li>
+            <li><code>/stats</code> - Statistiques de la campagne</li>
+            <li><code>/help</code> - Aide et liste des commandes</li>
         </ul>
 
         <div class="info-box">
-            <h3>🎯 Fonctionnement :</h3>
+            <h3>🎯 Comment ça marche :</h3>
             <ol>
-                <li>📂 Uploadez votre fichier CSV</li>
-                <li>🏦 Détection automatique des banques via IBAN</li>
-                <li>📞 Chaque appel affiche la fiche client dans Telegram</li>
+                <li>📂 Uploadez votre fichier CSV avec les clients</li>
+                <li>📞 Configurez l'URL OVH CTI</li>
+                <li>✅ Chaque appel entrant affiche automatiquement la fiche client dans Telegram</li>
+                <li>🔍 Utilisez <code>/numero XXXXXXXXXX</code> pour rechercher un client</li>
             </ol>
-        </div>
-
-        <div class="info-box">
-            <h3>🔗 Configuration OVH CTI :</h3>
-            <code>https://web-production-95ca.up.railway.app/webhook/ovh?caller=*CALLING*&callee=*CALLED*&type=*EVENT*</code>
         </div>
     </div>
 </body>
 </html>
     """, 
     total_clients=upload_stats["total_clients"],
-    banks_detected=upload_stats.get("banks_detected", 0),
-    detection_rate=upload_stats.get("detection_rate", 0),
     last_upload=upload_stats["last_upload"],
     filename=upload_stats["filename"]
     )
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Upload et traitement des fichiers CSV"""
+    """Upload et traitement du fichier CSV"""
     try:
         if 'file' not in request.files:
             return jsonify({"error": "Aucun fichier sélectionné"}), 400
@@ -584,19 +500,18 @@ def upload_file():
         filename = secure_filename(file.filename)
         upload_stats["filename"] = filename
         
-        if filename.lower().endswith('.csv'):
-            content = file.read().decode('utf-8-sig')
+        # Lecture CSV uniquement
+        if filename.endswith('.csv'):
+            content = file.read().decode('utf-8-sig')  # utf-8-sig pour gérer le BOM Excel
             nb_clients = load_clients_from_csv(content)
         else:
-            return jsonify({"error": "Seuls les fichiers CSV sont supportés"}), 400
+            return jsonify({"error": "Seuls les fichiers CSV sont supportés dans cette version"}), 400
         
         return jsonify({
             "status": "success",
-            "message": f"{nb_clients} clients chargés avec succès depuis CSV",
+            "message": f"{nb_clients} clients chargés avec succès",
             "filename": filename,
-            "total_clients": nb_clients,
-            "banks_detected": upload_stats.get("banks_detected", 0),
-            "detection_rate": f"{upload_stats.get('detection_rate', 0)}%"
+            "total_clients": nb_clients
         })
         
     except Exception as e:
@@ -604,14 +519,15 @@ def upload_file():
 
 @app.route('/clients')
 def view_clients():
-    """Visualisation des clients"""
+    """Interface de visualisation des clients"""
     search = request.args.get('search', '')
     
     if search:
         search_lower = search.lower()
         filtered_clients = {k: v for k, v in clients_database.items() 
-                          if search_lower in f"{v['nom']} {v['prenom']} {v['telephone']} {v['email']} {v.get('banque_detectee', '')}".lower()}
+                          if search_lower in f"{v['nom']} {v['prenom']} {v['telephone']} {v['entreprise']} {v['email']} {v['ville']}".lower()}
     else:
+        # Limite à 100 pour la performance
         filtered_clients = dict(list(clients_database.items())[:100])
     
     return render_template_string("""
@@ -620,80 +536,191 @@ def view_clients():
 <head>
     <title>👥 Gestion Clients</title>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         .container { max-width: 1600px; margin: 0 auto; }
-        .search input { padding: 10px; width: 400px; border: 1px solid #ddd; border-radius: 5px; }
+        .search { margin-bottom: 20px; }
+        .search input { padding: 10px; width: 300px; border: 1px solid #ddd; border-radius: 5px; }
         .btn { background: #2196F3; color: white; padding: 10px 20px; border: none; cursor: pointer; border-radius: 5px; margin: 5px; text-decoration: none; display: inline-block; }
+        .btn:hover { background: #1976D2; }
         table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background: #f2f2f2; }
-        .bank-detected { background: #e8f5e8; font-weight: bold; }
-        .bank-unknown { background: #ffebee; }
+        th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+        th { background: #f2f2f2; position: sticky; top: 0; }
+        .status-prospect { background: #fff3e0; }
+        .status-client { background: #e8f5e8; }
+        .stats { background: #f0f4f8; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        .table-container { max-height: 600px; overflow-y: auto; }
+        .highlight { background: yellow; }
     </style>
+    <script>
+        function highlightSearch() {
+            const search = '{{ search }}';
+            if (search) {
+                const cells = document.querySelectorAll('td');
+                cells.forEach(cell => {
+                    if (cell.textContent.toLowerCase().includes(search.toLowerCase())) {
+                        cell.innerHTML = cell.innerHTML.replace(new RegExp(search, 'gi'), '<span class="highlight">$&</span>');
+                    }
+                });
+            }
+        }
+        window.onload = highlightSearch;
+    </script>
 </head>
 <body>
     <div class="container">
         <h1>👥 Base Clients ({{ total_clients }} total)</h1>
         
+        <div class="stats">
+            <strong>📊 Statistiques:</strong> 
+            Total: {{ total_clients }} | 
+            Affichés: {{ displayed_count }} |
+            Avec appels: {{ with_calls }} |
+            Aujourd'hui: {{ today_calls }}
+        </div>
+        
         <div class="search">
             <form method="GET">
-                <input type="text" name="search" placeholder="Rechercher..." value="{{ search }}">
+                <input type="text" name="search" placeholder="Rechercher (nom, téléphone, entreprise, email, ville...)" value="{{ search }}">
                 <button type="submit" class="btn">🔍 Rechercher</button>
                 <a href="/clients" class="btn">🔄 Tout afficher</a>
                 <a href="/" class="btn">🏠 Accueil</a>
             </form>
         </div>
         
-        <table>
-            <tr>
-                <th>📞 Téléphone</th>
-                <th>👤 Nom</th>
-                <th>👤 Prénom</th>
-                <th>📧 Email</th>
-                <th>🏘️ Ville</th>
-                <th>🏦 Banque Détectée</th>
-                <th>💳 IBAN</th>
-                <th>📊 Statut</th>
-                <th>📈 Appels</th>
-            </tr>
-            {% for tel, client in clients %}
-            <tr>
-                <td><strong>{{ tel }}</strong></td>
-                <td>{{ client.nom }}</td>
-                <td>{{ client.prenom }}</td>
-                <td>{{ client.email }}</td>
-                <td>{{ client.ville }}</td>
-                <td class="{% if client.get('banque_detectee') and client.banque_detectee not in ['Non détectée', 'Pas d\'IBAN'] %}bank-detected{% else %}bank-unknown{% endif %}">
-                    {{ client.get('banque_detectee', 'N/A') }}
-                </td>
-                <td style="font-size: 10px;">{{ client.get('iban', '')[:20] }}...</td>
-                <td>{{ client.statut }}</td>
-                <td style="text-align: center;">{{ client.nb_appels }}</td>
-            </tr>
-            {% endfor %}
-        </table>
+        <div class="table-container">
+            <table>
+                <tr>
+                    <th>📞 Téléphone</th>
+                    <th>👤 Nom</th>
+                    <th>👤 Prénom</th>
+                    <th>🏢 Entreprise</th>
+                    <th>📧 Email</th>
+                    <th>🏘️ Ville</th>
+                    <th>🏦 Banque</th>
+                    <th>📊 Statut</th>
+                    <th>📈 Appels</th>
+                    <th>🕐 Dernier</th>
+                    <th>📋 Upload</th>
+                </tr>
+                {% for tel, client in clients %}
+                <tr class="status-{{ client.statut.lower().replace(' ', '') }}">
+                    <td><strong>{{ tel }}</strong></td>
+                    <td>{{ client.nom }}</td>
+                    <td>{{ client.prenom }}</td>
+                    <td>{{ client.entreprise }}</td>
+                    <td>{{ client.email }}</td>
+                    <td>{{ client.ville }}</td>
+                    <td>{{ client.banque }}</td>
+                    <td><strong>{{ client.statut }}</strong></td>
+                    <td style="text-align: center;">{{ client.nb_appels }}</td>
+                    <td>{{ client.dernier_appel or '-' }}</td>
+                    <td>{{ client.date_upload }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        
+        {% if displayed_count >= 100 and total_clients > 100 %}
+        <p style="color: orange;"><strong>⚠️ Affichage limité aux 100 premiers clients. Utilisez la recherche pour filtrer.</strong></p>
+        {% endif %}
     </div>
 </body>
 </html>
     """,
     clients=filtered_clients.items(),
     total_clients=upload_stats["total_clients"],
+    displayed_count=len(filtered_clients),
+    with_calls=len([c for c in clients_database.values() if c['nb_appels'] > 0]),
+    today_calls=len([c for c in clients_database.values() if c['dernier_appel'] and c['dernier_appel'].startswith(datetime.now().strftime('%d/%m/%Y'))]),
     search=search
     )
+
+@app.route('/clear-clients')
+def clear_clients():
+    """Vide la base de données clients"""
+    global clients_database, upload_stats
+    clients_database = {}
+    upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
+    return redirect('/')
+
+@app.route('/setup-telegram-webhook')
+def setup_telegram_webhook():
+    """Configure le webhook Telegram pour recevoir les commandes"""
+    try:
+        webhook_url = f"https://web-production-95ca.up.railway.app/webhook/telegram"
+        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        
+        data = {"url": webhook_url}
+        response = requests.post(telegram_api_url, data=data)
+        
+        return jsonify({
+            "status": "webhook_configured",
+            "telegram_response": response.json(),
+            "webhook_url": webhook_url
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/test-telegram')
+def test_telegram():
+    """Test d'envoi Telegram"""
+    message = f"🧪 Test de connexion - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    result = send_telegram_message(message)
+    
+    if result:
+        return jsonify({"status": "success", "message": "Test Telegram envoyé avec succès"})
+    else:
+        return jsonify({"status": "error", "message": "Échec du test Telegram"})
+
+@app.route('/test-command')
+def test_command():
+    """Test de la commande /numero"""
+    # Test avec un client existant s'il y en a
+    if clients_database:
+        test_number = list(clients_database.keys())[0]
+    else:
+        test_number = "0767328146"  # Numéro par défaut
+    
+    result = process_telegram_command(f"/numero {test_number}", CHAT_ID)
+    return jsonify({"test_result": result, "test_number": test_number})
+
+@app.route('/test-ovh-cgi')
+def test_ovh_cgi():
+    """Test du webhook OVH format CGI"""
+    from urllib.parse import urlencode
+    
+    # Test avec un client existant s'il y en a
+    if clients_database:
+        test_caller = list(clients_database.keys())[0]
+    else:
+        test_caller = "0767328146"
+    
+    params = {
+        'caller': test_caller,
+        'callee': '0033185093001', 
+        'type': 'start_ringing'
+    }
+    
+    return f"""
+    <h2>🧪 Test OVH CGI</h2>
+    <p>Simulation d'un appel OVH avec paramètres CGI</p>
+    <p><a href="/webhook/ovh?{urlencode(params)}" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🎯 Déclencher test appel</a></p>
+    <p><strong>Paramètres de test:</strong> {params}</p>
+    <p><a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🏠 Retour accueil</a></p>
+    """
 
 @app.route('/health')
 def health():
     return jsonify({
-        "status": "healthy",
-        "service": "webhook-ovh-telegram-ultra-simple",
+        "status": "healthy", 
+        "service": "webhook-ovh-telegram",
+        "telegram_configured": bool(TELEGRAM_TOKEN and CHAT_ID),
         "clients_loaded": upload_stats["total_clients"],
-        "banks_detected": upload_stats.get("banks_detected", 0),
-        "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "version": "ultra-simple-no-deps"
+        "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
 
 if __name__ == '__main__':
-    # Utilisation du serveur Flask intégré au lieu de gunicorn
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
