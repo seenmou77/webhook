@@ -164,7 +164,7 @@ def process_telegram_command(message_text, chat_id):
         print(f"❌ Erreur commande Telegram: {str(e)}")
         return {"error": str(e)}
 
-@app.route('/webhook/ovh', methods=['POST'])
+@app.route('/webhook/ovh', methods=['POST', 'GET'])
 def ovh_webhook():
     """Webhook pour recevoir les appels OVH"""
     try:
