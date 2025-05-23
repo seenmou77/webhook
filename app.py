@@ -33,32 +33,47 @@ def load_clients_from_csv(file_content):
         # Utilisation du module csv de Python
         csv_reader = csv.DictReader(io.StringIO(file_content))
         
-        for row in csv_reader:
+        print(f"🔍 Colonnes détectées: {csv_reader.fieldnames}")
+        
+        for row_index, row in enumerate(csv_reader):
             # Normalisation des clés (lowercase et strip)
             normalized_row = {}
             for key, value in row.items():
                 if key:  # Éviter les clés None
                     normalized_row[key.lower().strip()] = str(value).strip() if value else ""
             
+            # Debug: afficher la première ligne pour diagnostic
+            if row_index == 0:
+                print(f"🔍 Première ligne normalisée: {normalized_row}")
+            
             # Recherche colonne téléphone
             telephone = None
             tel_columns = ['telephone', 'tel', 'phone', 'numero', 'number', 'mobile']
             for tel_key in tel_columns:
                 if tel_key in normalized_row and normalized_row[tel_key]:
-                    telephone = normalized_row[tel_key]
+                    telephone = str(normalized_row[tel_key])  # Force conversion en string
                     break
             
-            if not telephone:
+            if not telephone or telephone == 'nan' or telephone == '':
+                print(f"⚠️ Ligne {row_index + 2}: Numéro manquant ou invalide: '{telephone}'")
                 continue
                 
-            # Normalisation du numéro
+            # Normalisation du numéro - traitement spécial pour les entiers
             telephone = telephone.replace(' ', '').replace('.', '').replace('-', '').replace('(', '').replace(')', '')
-            if telephone.startswith('+33'):
-                telephone = '0' + telephone[3:]
-            elif telephone.startswith('33') and len(telephone) > 10:
-                telephone = '0' + telephone[2:]
             
-            if len(telephone) >= 10 and telephone.startswith('0'):
+            # Gestion des numéros qui peuvent être des entiers (ex: 644928542 au lieu de 0644928542)
+            if telephone.isdigit():
+                if len(telephone) == 9 and not telephone.startswith('0'):
+                    telephone = '0' + telephone  # Ajouter le 0 initial
+                elif len(telephone) == 11 and telephone.startswith('33'):
+                    telephone = '0' + telephone[2:]  # 33644928542 -> 0644928542
+                elif len(telephone) == 12 and telephone.startswith('+33'):
+                    telephone = '0' + telephone[3:]  # +33644928542 -> 0644928542
+            
+            # Validation finale
+            if len(telephone) >= 10 and telephone.startswith('0') and telephone.isdigit():
+                print(f"✅ Traitement client: {telephone} - {normalized_row.get('nom', '')} {normalized_row.get('prenom', '')}")
+                
                 clients_database[telephone] = {
                     # Informations de base
                     "nom": normalized_row.get('nom', ''),
@@ -92,10 +107,13 @@ def load_clients_from_csv(file_content):
                     "dernier_appel": None,
                     "notes": ""
                 }
+            else:
+                print(f"❌ Ligne {row_index + 2}: Numéro invalide après normalisation: '{telephone}'")
         
         upload_stats["total_clients"] = len(clients_database)
         upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
+        print(f"📊 Résultat final: {len(clients_database)} clients chargés")
         return len(clients_database)
         
     except Exception as e:
@@ -500,9 +518,25 @@ def upload_file():
         filename = secure_filename(file.filename)
         upload_stats["filename"] = filename
         
-        # Lecture CSV uniquement
+        # Lecture CSV avec gestion d'encodage améliorée
         if filename.endswith('.csv'):
-            content = file.read().decode('utf-8-sig')  # utf-8-sig pour gérer le BOM Excel
+            file_content = file.read()
+            
+            # Essai de différents encodages
+            content = None
+            encodings_to_try = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1', 'latin1']
+            
+            for encoding in encodings_to_try:
+                try:
+                    content = file_content.decode(encoding)
+                    print(f"✅ Fichier décodé avec l'encodage: {encoding}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            if content is None:
+                return jsonify({"error": "Impossible de décoder le fichier. Vérifiez l'encodage."}), 400
+            
             nb_clients = load_clients_from_csv(content)
         else:
             return jsonify({"error": "Seuls les fichiers CSV sont supportés dans cette version"}), 400
