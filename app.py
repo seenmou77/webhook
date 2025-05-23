@@ -297,19 +297,9 @@ def process_telegram_command(message_text, chat_id):
 
 @app.route('/webhook/ovh', methods=['POST', 'GET'])
 def ovh_webhook():
-    """Webhook pour recevoir les appels OVH - VERSION DEBUG"""
+    """Webhook pour recevoir les appels OVH"""
     try:
         timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        
-        # === DEBUG: LOG TOUS LES APPELS ===
-        print(f"🔥 WEBHOOK APPELÉ À {timestamp}")
-        print(f"🔥 Méthode: {request.method}")
-        print(f"🔥 URL complète: {request.url}")
-        print(f"🔥 Headers: {dict(request.headers)}")
-        print(f"🔥 Args GET: {dict(request.args)}")
-        if request.method == 'POST':
-            print(f"🔥 Body POST: {request.get_data()}")
-            print(f"🔥 JSON POST: {request.get_json()}")
         
         if request.method == 'GET':
             caller_number = request.args.get('caller', 'Inconnu')
@@ -329,30 +319,20 @@ def ovh_webhook():
             print(f"🔔 [{timestamp}] Appel JSON:")
             print(f"📋 Données: {json.dumps(data, indent=2)}")
         
-        # === FORCE UN NUMÉRO POUR TEST SI AUCUN REÇU ===
-        if caller_number == 'Inconnu':
-            caller_number = "0767328146"  # Numéro de test
-            print(f"⚠️ AUCUN NUMÉRO REÇU - UTILISATION DU NUMÉRO TEST: {caller_number}")
-        
-        # Récupération fiche client (fonctionne même pour inconnus)
+        # Récupération fiche client
         client_info = get_client_info(caller_number)
-        print(f"👤 Client trouvé: {client_info['nom']} {client_info['prenom']}")
         
         # Message Telegram formaté
         telegram_message = format_client_message(client_info, context="appel")
         telegram_message += f"\n📊 Statut appel: {call_status}"
-        telegram_message += f"\n🔧 DEBUG: Webhook reçu à {timestamp}"
         
-        print(f"📱 Envoi message Telegram...")
-        
-        # Envoi vers Telegram avec plus de debug
+        # Envoi vers Telegram
         telegram_result = send_telegram_message(telegram_message)
         
         if telegram_result:
-            print("✅ Message Telegram envoyé avec succès")
-            print(f"📱 Réponse Telegram: {telegram_result}")
+            print("✅ Message Telegram envoyé")
         else:
-            print("❌ ÉCHEC envoi Telegram")
+            print("❌ Échec envoi Telegram")
         
         return jsonify({
             "status": "success",
@@ -361,20 +341,11 @@ def ovh_webhook():
             "method": request.method,
             "telegram_sent": telegram_result is not None,
             "client": f"{client_info['prenom']} {client_info['nom']}",
-            "client_status": client_info['statut'],
-            "debug": "webhook_received"
+            "client_status": client_info['statut']
         })
         
     except Exception as e:
-        error_msg = f"❌ Erreur webhook: {str(e)}"
-        print(error_msg)
-        
-        # Envoi erreur à Telegram aussi
-        try:
-            send_telegram_message(f"🚨 ERREUR WEBHOOK\n{error_msg}\nTimestamp: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-        except:
-            pass
-            
+        print(f"❌ Erreur webhook: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/telegram', methods=['POST'])
