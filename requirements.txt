@@ -1,5 +1,5 @@
-flask
-requests
-pandas
-openpyxl
-werkzeug
+Flask==2.3.3
+requests==2.31.0
+python-telegram-bot==20.6
+ovh==1.0.0
+gunicorn==21.2.0
