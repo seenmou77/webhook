@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Version simplifiée sans pandas pour éviter les problèmes de dépendances
-Support CSV uniquement mais plus stable
+app.py - Version ultra-simple SANS gunicorn ni requirements.txt
+Utilise uniquement les bibliothèques standard de Python
 """
 
 from flask import Flask, request, jsonify, render_template_string, redirect
 import os
 import json
-import requests
+import urllib.request
+import urllib.parse
 import csv
 import io
 import re
@@ -259,7 +260,7 @@ def get_client_info(phone_number):
     }
 
 def send_telegram_message(message):
-    """Envoie un message vers Telegram"""
+    """Envoie un message vers Telegram en utilisant urllib"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {
@@ -267,8 +268,15 @@ def send_telegram_message(message):
             'text': message,
             'parse_mode': 'HTML'
         }
-        response = requests.post(url, data=data, timeout=10)
-        return response.json()
+        
+        # Utilisation urllib au lieu de requests
+        data_encoded = urllib.parse.urlencode(data).encode('utf-8')
+        req = urllib.request.Request(url, data=data_encoded, method='POST')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = response.read().decode('utf-8')
+            return json.loads(result)
+            
     except Exception as e:
         print(f"❌ Erreur Telegram: {str(e)}")
         return None
@@ -482,13 +490,18 @@ def home():
         .btn-success { background: #4CAF50; }
         .success { color: #4CAF50; font-weight: bold; }
         .info-box { background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 10px 0; }
+        .warning { background: #fff3cd; padding: 15px; border-radius: 8px; margin: 10px 0; color: #856404; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 Webhook OVH-Telegram 🏦</h1>
-            <p class="success">✅ Support CSV - Détection automatique des banques</p>
+            <p class="success">✅ Version Ultra-Simple - Détection automatique des banques</p>
+        </div>
+
+        <div class="warning">
+            <strong>⚡ Version Sans Dépendances :</strong> Cette version utilise uniquement les bibliothèques standard Python pour éviter les problèmes de déploiement Railway.
         </div>
 
         <div class="stats">
@@ -540,6 +553,11 @@ def home():
                 <li>🏦 Détection automatique des banques via IBAN</li>
                 <li>📞 Chaque appel affiche la fiche client dans Telegram</li>
             </ol>
+        </div>
+
+        <div class="info-box">
+            <h3>🔗 Configuration OVH CTI :</h3>
+            <code>https://web-production-95ca.up.railway.app/webhook/ovh?caller=*CALLING*&callee=*CALLED*&type=*EVENT*</code>
         </div>
     </div>
 </body>
@@ -668,12 +686,14 @@ def view_clients():
 def health():
     return jsonify({
         "status": "healthy",
-        "service": "webhook-ovh-telegram-csv",
+        "service": "webhook-ovh-telegram-ultra-simple",
         "clients_loaded": upload_stats["total_clients"],
         "banks_detected": upload_stats.get("banks_detected", 0),
-        "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "version": "ultra-simple-no-deps"
     })
 
 if __name__ == '__main__':
+    # Utilisation du serveur Flask intégré au lieu de gunicorn
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
