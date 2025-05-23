@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Application Flask avec support CSV et Excel
-Version corrigée sans erreurs de syntaxe
+app.py - Version simplifiée sans pandas pour éviter les problèmes de dépendances
+Support CSV uniquement mais plus stable
 """
 
 from flask import Flask, request, jsonify, render_template_string, redirect
@@ -12,7 +12,6 @@ import requests
 import csv
 import io
 import re
-import pandas as pd
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
@@ -48,14 +47,12 @@ class BankDetector:
             '16958': 'La Banque Postale',
             '20817': 'HSBC France',
             '30056': 'Caisse d\'Épargne',
-            '20041': 'Boursorama Banque',
             '16967': 'Hello Bank (BNP Paribas)',
             '18206': 'Fortuneo',
             '19138': 'BforBank (Crédit Agricole)',
             '20395': 'ING Direct',
             '16586': 'Revolut',
             '14437': 'N26',
-            '16958': 'Nickel (Compte-Nickel)',
             '17515': 'CIC',
             '30027': 'Crédit du Nord',
             '13135': 'Crédit Coopératif',
@@ -120,114 +117,6 @@ def detect_and_add_bank_info(client_data):
         client_data['code_banque'] = ''
     
     return client_data
-
-def extract_city_from_address(address):
-    """Extrait la ville depuis l'adresse complète"""
-    if not address:
-        return ''
-    
-    # Pattern pour extraire ville après code postal
-    pattern = r'\d{5}\s+([A-Z\-\s]+)$'
-    match = re.search(pattern, address.upper())
-    
-    if match:
-        return match.group(1).strip()
-    
-    return ''
-
-def load_clients_from_excel(file_content):
-    """Charge les clients depuis un fichier Excel"""
-    global clients_database, upload_stats
-    
-    clients_database = {}
-    banks_detected = 0
-    
-    try:
-        df = pd.read_excel(io.BytesIO(file_content))
-        
-        print(f"Excel lu: {len(df)} lignes, {len(df.columns)} colonnes")
-        
-        # Nettoyer les noms de colonnes
-        df.columns = df.columns.str.strip()
-        
-        for index, row in df.iterrows():
-            # Extraction téléphone
-            telephone = str(row.get('N° Mobile', '')).strip()
-            if not telephone or telephone == 'nan':
-                continue
-                
-            # Normalisation du numéro
-            telephone = telephone.replace(' ', '').replace('.', '').replace('-', '')
-            if telephone.startswith('+33'):
-                telephone = '0' + telephone[3:]
-            elif telephone.startswith('33') and len(telephone) > 10:
-                telephone = '0' + telephone[2:]
-            
-            if len(telephone) >= 10 and telephone.startswith('0'):
-                # Traitement adresse
-                adresse_complete = str(row.get('Adresse', '')).strip()
-                ville = extract_city_from_address(adresse_complete)
-                
-                # Traitement date de naissance
-                date_naissance = row.get('Date de Naissance', '')
-                if pd.notna(date_naissance):
-                    if isinstance(date_naissance, pd.Timestamp):
-                        date_naissance = date_naissance.strftime('%d/%m/%Y')
-                    else:
-                        date_naissance = str(date_naissance)
-                else:
-                    date_naissance = 'Non renseigné'
-                
-                client_data = {
-                    "nom": str(row.get('Nom', '')).strip(),
-                    "prenom": str(row.get('Prénom', '')).strip(),
-                    "email": str(row.get('Email', '')).strip(),
-                    "entreprise": '',
-                    "telephone": telephone,
-                    "adresse": adresse_complete,
-                    "ville": ville,
-                    "code_postal": str(int(row.get('Code postal', 0))) if pd.notna(row.get('Code postal')) else '',
-                    "banque": '',
-                    "swift": '',
-                    "iban": str(row.get('IBAN', '')).strip(),
-                    "sexe": '',
-                    "date_naissance": date_naissance,
-                    "lieu_naissance": 'Non renseigné',
-                    "profession": '',
-                    "nationalite": '',
-                    "situation_familiale": '',
-                    "statut": 'Prospect',
-                    "date_upload": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    "nb_appels": 0,
-                    "dernier_appel": None,
-                    "notes": "",
-                    "age": str(int(row.get('Age', 0))) if pd.notna(row.get('Age')) else ''
-                }
-                
-                # Détection banque
-                client_data = detect_and_add_bank_info(client_data)
-                
-                if client_data.get('banque_detectee') and client_data['banque_detectee'] not in ['Non détectée', 'Pas d\'IBAN']:
-                    banks_detected += 1
-                
-                clients_database[telephone] = client_data
-        
-        total_clients = len(clients_database)
-        detection_rate = (banks_detected / total_clients * 100) if total_clients > 0 else 0
-        
-        upload_stats["total_clients"] = total_clients
-        upload_stats["banks_detected"] = banks_detected
-        upload_stats["detection_rate"] = round(detection_rate, 1)
-        upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        
-        print(f"✅ {total_clients} clients chargés depuis Excel")
-        print(f"🏦 {banks_detected} banques détectées ({detection_rate:.1f}%)")
-        
-        return total_clients
-        
-    except Exception as e:
-        print(f"Erreur lecture Excel: {str(e)}")
-        raise ValueError(f"Erreur lecture Excel: {str(e)}")
 
 def load_clients_from_csv(file_content):
     """Charge les clients depuis un contenu CSV"""
@@ -577,7 +466,7 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🤖 Webhook OVH-Telegram avec Support Excel</title>
+    <title>🤖 Webhook OVH-Telegram avec Détection Banques</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
@@ -598,8 +487,8 @@ def home():
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 Webhook OVH-Telegram 📊</h1>
-            <p class="success">✅ Support CSV et Excel - Détection automatique des banques</p>
+            <h1>🤖 Webhook OVH-Telegram 🏦</h1>
+            <p class="success">✅ Support CSV - Détection automatique des banques</p>
         </div>
 
         <div class="stats">
@@ -623,17 +512,17 @@ def home():
         </div>
 
         <div class="upload-section">
-            <h2>📂 Upload fichier clients (CSV ou Excel)</h2>
+            <h2>📂 Upload fichier clients (CSV)</h2>
             <form action="/upload" method="post" enctype="multipart/form-data">
                 <div class="info-box">
-                    <p><strong>📋 Formats supportés:</strong> CSV (.csv), Excel (.xlsx, .xls)</p>
-                    <p><strong>🔥 Colonne obligatoire:</strong> téléphone (N° Mobile, telephone, etc.)</p>
+                    <p><strong>📋 Format supporté:</strong> CSV (.csv)</p>
+                    <p><strong>🔥 Colonne obligatoire:</strong> téléphone (telephone, N° Mobile, etc.)</p>
                     <p><strong>🏦 Détection banque:</strong> IBAN analysé automatiquement</p>
-                    <p><strong>✨ Colonnes supportées:</strong> Nom, Prénom, Email, Adresse, IBAN, Date de Naissance, etc.</p>
+                    <p><strong>✨ Colonnes supportées:</strong> nom, prenom, email, adresse, ville, iban, etc.</p>
                 </div>
-                <input type="file" name="file" accept=".csv,.xlsx,.xls" required style="margin: 10px 0;">
+                <input type="file" name="file" accept=".csv" required style="margin: 10px 0;">
                 <br>
-                <button type="submit" class="btn btn-success">📁 Charger fichier</button>
+                <button type="submit" class="btn btn-success">📁 Charger fichier CSV</button>
             </form>
         </div>
 
@@ -647,7 +536,7 @@ def home():
         <div class="info-box">
             <h3>🎯 Fonctionnement :</h3>
             <ol>
-                <li>📂 Uploadez votre fichier CSV ou Excel</li>
+                <li>📂 Uploadez votre fichier CSV</li>
                 <li>🏦 Détection automatique des banques via IBAN</li>
                 <li>📞 Chaque appel affiche la fiche client dans Telegram</li>
             </ol>
@@ -665,7 +554,7 @@ def home():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Upload et traitement des fichiers CSV et Excel"""
+    """Upload et traitement des fichiers CSV"""
     try:
         if 'file' not in request.files:
             return jsonify({"error": "Aucun fichier sélectionné"}), 400
@@ -677,22 +566,16 @@ def upload_file():
         filename = secure_filename(file.filename)
         upload_stats["filename"] = filename
         
-        file_extension = filename.lower().split('.')[-1]
-        
-        if file_extension == 'csv':
+        if filename.lower().endswith('.csv'):
             content = file.read().decode('utf-8-sig')
             nb_clients = load_clients_from_csv(content)
-        elif file_extension in ['xlsx', 'xls']:
-            content = file.read()
-            nb_clients = load_clients_from_excel(content)
         else:
-            return jsonify({"error": "Format non supporté. Utilisez CSV ou Excel"}), 400
+            return jsonify({"error": "Seuls les fichiers CSV sont supportés"}), 400
         
         return jsonify({
             "status": "success",
-            "message": f"{nb_clients} clients chargés avec succès depuis {file_extension.upper()}",
+            "message": f"{nb_clients} clients chargés avec succès depuis CSV",
             "filename": filename,
-            "file_type": file_extension.upper(),
             "total_clients": nb_clients,
             "banks_detected": upload_stats.get("banks_detected", 0),
             "detection_rate": f"{upload_stats.get('detection_rate', 0)}%"
@@ -781,51 +664,13 @@ def view_clients():
     search=search
     )
 
-@app.route('/clear-clients')
-def clear_clients():
-    """Vide la base de données clients"""
-    global clients_database, upload_stats
-    clients_database = {}
-    upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0, "detection_rate": 0}
-    return redirect('/')
-
-@app.route('/setup-telegram-webhook')
-def setup_telegram_webhook():
-    """Configure le webhook Telegram"""
-    try:
-        webhook_url = f"https://web-production-95ca.up.railway.app/webhook/telegram"
-        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-        
-        data = {"url": webhook_url}
-        response = requests.post(telegram_api_url, data=data)
-        
-        return jsonify({
-            "status": "webhook_configured",
-            "telegram_response": response.json(),
-            "webhook_url": webhook_url
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/test-telegram')
-def test_telegram():
-    """Test d'envoi Telegram"""
-    message = f"🧪 Test - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-    result = send_telegram_message(message)
-    
-    if result:
-        return jsonify({"status": "success", "message": "Test Telegram OK"})
-    else:
-        return jsonify({"status": "error", "message": "Échec test Telegram"})
-
 @app.route('/health')
 def health():
     return jsonify({
         "status": "healthy",
-        "service": "webhook-ovh-telegram-excel",
+        "service": "webhook-ovh-telegram-csv",
         "clients_loaded": upload_stats["total_clients"],
         "banks_detected": upload_stats.get("banks_detected", 0),
-        "supported_formats": ["CSV", "Excel"],
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
 
