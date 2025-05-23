@@ -168,15 +168,28 @@ def process_telegram_command(message_text, chat_id):
 def ovh_webhook():
     """Webhook pour recevoir les appels OVH"""
     try:
-        data = request.get_json()
         timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
-        # Extraction des données d'appel
-        caller_number = data.get('callerIdNumber', 'Inconnu')
-        call_status = data.get('status', 'incoming')
+        # Gestion des paramètres OVH CTI (GET avec query params)
+        if request.method == 'GET':
+            caller_number = request.args.get('caller', 'Inconnu')
+            called_number = request.args.get('callee', 'Inconnu') 
+            event_type = request.args.get('type', 'unknown')
+            call_status = f"CGI-{event_type}"
+            
+            print(f"🔔 [{timestamp}] Appel CGI OVH:")
+            print(f"📞 Appelant: {caller_number}")
+            print(f"📞 Appelé: {called_number}")
+            print(f"📋 Type: {event_type}")
         
-        print(f"🔔 [{timestamp}] Appel de: {caller_number}")
-        print(f"📋 Données: {json.dumps(data, indent=2)}")
+        # Gestion JSON classique (POST)
+        else:
+            data = request.get_json() or {}
+            caller_number = data.get('callerIdNumber', request.args.get('caller', 'Inconnu'))
+            call_status = data.get('status', 'incoming')
+            
+            print(f"🔔 [{timestamp}] Appel JSON:")
+            print(f"📋 Données: {json.dumps(data, indent=2)}")
         
         # Récupération fiche client
         client_info = get_client_info(caller_number)
@@ -197,6 +210,7 @@ def ovh_webhook():
             "status": "success",
             "timestamp": timestamp,
             "caller": caller_number,
+            "method": request.method,
             "telegram_sent": telegram_result is not None,
             "client": f"{client_info['prenom']} {client_info['nom']}"
         })
