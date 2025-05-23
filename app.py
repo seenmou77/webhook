@@ -10,6 +10,79 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '7822148813:AAEhWJWToLUY5heVP1G_yqM1Io-vmAMlbLg')
 CHAT_ID = os.environ.get('CHAT_ID', '-1002652961145')
 
+def get_client_info(phone_number):
+    """Récupère les infos client (base de données simulée)"""
+    # Base de données clients simulée
+    clients_db = {
+        "0767328146": {
+            "nom": "CHAIZE",
+            "prenom": "GWENDOLINE",
+            "banque": "Boursorama Banque",
+            "swift": "BOUSFRPPXXXX",
+            "iban": "FR76406188027900040096368?8",
+            "adresse": "47 RUE DE SAINT CYR",
+            "code_postal": "69009",
+            "ville": "LYON",
+            "email": "gwendoline.chaize@gmail.com",
+            "telephone": "0767328146",
+            "sexe": "M",
+            "date_naissance": "Non renseigné",
+            "lieu_naissance": "Non renseigné",
+            "contrat": "Premium Support",
+            "derniere_intervention": "20/05/2025"
+        },
+        "0123456789": {
+            "nom": "MARTIN",
+            "prenom": "DUPONT",
+            "banque": "BNP Paribas",
+            "swift": "BNPAFRPPXXX",
+            "iban": "FR1420041010050500013M02606",
+            "adresse": "15 Avenue des Champs",
+            "code_postal": "75008",
+            "ville": "PARIS",
+            "email": "martin.dupont@tech-solutions.fr",
+            "telephone": "0123456789",
+            "sexe": "M",
+            "date_naissance": "15/03/1985",
+            "lieu_naissance": "Paris",
+            "contrat": "Premium Support",
+            "derniere_intervention": "15/05/2025"
+        }
+    }
+    
+    return clients_db.get(phone_number, {
+        "nom": "INCONNU",
+        "prenom": "CLIENT",
+        "banque": "N/A",
+        "swift": "N/A", 
+        "iban": "N/A",
+        "adresse": "N/A",
+        "code_postal": "N/A",
+        "ville": "N/A",
+        "email": "N/A",
+        "telephone": phone_number,
+        "sexe": "N/A",
+        "date_naissance": "N/A",
+        "lieu_naissance": "N/A",
+        "contrat": "À vérifier",
+        "derniere_intervention": "N/A"
+    })
+
+def send_telegram_message(message):
+    """Envoie un message vers Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            'chat_id': CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+        response = requests.post(url, data=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"❌ Erreur Telegram: {str(e)}")
+        return None
+
 def format_client_message(client_info, context="appel"):
     """Formate un message client pour Telegram"""
     if context == "appel":
@@ -91,64 +164,6 @@ def process_telegram_command(message_text, chat_id):
         print(f"❌ Erreur commande Telegram: {str(e)}")
         return {"error": str(e)}
 
-def get_client_info(phone_number):
-    """Récupère les infos client (base de données simulée)"""
-    # Base de données clients simulée
-    clients_db = {
-        "0767328146": {
-            "nom": "CHAIZE",
-            "prenom": "GWENDOLINE",
-            "banque": "Boursorama Banque",
-            "swift": "BOUSFRPPXXXX",
-            "iban": "FR76406188027900040096368?8",
-            "adresse": "47 RUE DE SAINT CYR",
-            "code_postal": "69009",
-            "ville": "LYON",
-            "email": "gwendoline.chaize@gmail.com",
-            "telephone": "0767328146",
-            "sexe": "M",
-            "date_naissance": "Non renseigné",
-            "lieu_naissance": "Non renseigné",
-            "contrat": "Premium Support",
-            "derniere_intervention": "20/05/2025"
-        },
-        "0123456789": {
-            "nom": "MARTIN",
-            "prenom": "DUPONT",
-            "banque": "BNP Paribas",
-            "swift": "BNPAFRPPXXX",
-            "iban": "FR1420041010050500013M02606",
-            "adresse": "15 Avenue des Champs",
-            "code_postal": "75008",
-            "ville": "PARIS",
-            "email": "martin.dupont@tech-solutions.fr",
-            "telephone": "0123456789",
-            "sexe": "M",
-            "date_naissance": "15/03/1985",
-            "lieu_naissance": "Paris",
-            "contrat": "Premium Support",
-            "derniere_intervention": "15/05/2025"
-        }
-    }
-    
-    return clients_db.get(phone_number, {
-        "nom": "INCONNU",
-        "prenom": "CLIENT",
-        "banque": "N/A",
-        "swift": "N/A", 
-        "iban": "N/A",
-        "adresse": "N/A",
-        "code_postal": "N/A",
-        "ville": "N/A",
-        "email": "N/A",
-        "telephone": phone_number,
-        "sexe": "N/A",
-        "date_naissance": "N/A",
-        "lieu_naissance": "N/A",
-        "contrat": "À vérifier",
-        "derniere_intervention": "N/A"
-    })
-
 @app.route('/webhook/ovh', methods=['POST'])
 def ovh_webhook():
     """Webhook pour recevoir les appels OVH"""
@@ -166,20 +181,29 @@ def ovh_webhook():
         # Récupération fiche client
         client_info = get_client_info(caller_number)
         
-def send_telegram_message(message):
-    """Envoie un message vers Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {
-            'chat_id': CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        return response.json()
+        # Message Telegram formaté
+        telegram_message = format_client_message(client_info, context="appel")
+        telegram_message += f"\n📊 Statut: {call_status}"
+        
+        # Envoi vers Telegram
+        telegram_result = send_telegram_message(telegram_message)
+        
+        if telegram_result:
+            print("✅ Message Telegram envoyé")
+        else:
+            print("❌ Échec envoi Telegram")
+        
+        return jsonify({
+            "status": "success",
+            "timestamp": timestamp,
+            "caller": caller_number,
+            "telegram_sent": telegram_result is not None,
+            "client": f"{client_info['prenom']} {client_info['nom']}"
+        })
+        
     except Exception as e:
-        print(f"❌ Erreur Telegram: {str(e)}")
-        return None
+        print(f"❌ Erreur webhook: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/telegram', methods=['POST'])
 def telegram_webhook():
@@ -209,26 +233,6 @@ def telegram_webhook():
     except Exception as e:
         print(f"❌ Erreur webhook Telegram: {str(e)}")
         return jsonify({"error": str(e)}), 500
-        
-        # Envoi vers Telegram
-        telegram_result = send_telegram_message(telegram_message)
-        
-        if telegram_result:
-            print("✅ Message Telegram envoyé")
-        else:
-            print("❌ Échec envoi Telegram")
-        
-        return jsonify({
-            "status": "success",
-            "timestamp": timestamp,
-            "caller": caller_number,
-            "telegram_sent": telegram_result is not None,
-            "client": f"{client_info['prenom']} {client_info['nom']}"
-        })
-        
-    except Exception as e:
-        print(f"❌ Erreur webhook: {str(e)}")
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/')
 def home():
@@ -253,17 +257,6 @@ def home():
     <p>🕐 Dernière mise à jour: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}</p>
     """
 
-@app.route('/test-telegram')
-def test_telegram():
-    """Test d'envoi Telegram"""
-    message = f"🧪 Test de connexion - {datetime.now().strftime('%H:%M:%S')}"
-    result = send_telegram_message(message)
-    
-    if result:
-        return jsonify({"status": "success", "message": "Test Telegram envoyé"})
-    else:
-        return jsonify({"status": "error", "message": "Échec test Telegram"})
-
 @app.route('/setup-telegram-webhook')
 def setup_telegram_webhook():
     """Configure le webhook Telegram pour recevoir les commandes"""
@@ -281,6 +274,17 @@ def setup_telegram_webhook():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/test-telegram')
+def test_telegram():
+    """Test d'envoi Telegram"""
+    message = f"🧪 Test de connexion - {datetime.now().strftime('%H:%M:%S')}"
+    result = send_telegram_message(message)
+    
+    if result:
+        return jsonify({"status": "success", "message": "Test Telegram envoyé"})
+    else:
+        return jsonify({"status": "error", "message": "Échec test Telegram"})
 
 @app.route('/test-command')
 def test_command():
