@@ -85,7 +85,7 @@ def detect_bank_from_iban(iban):
     # Tentative 3: API abstractapi.com (gratuite avec limite)
     try:
         # Clé API gratuite - remplacez par votre clé si vous en avez une
-        api_key = os.environ.get('ABSTRACT_API_KEY', '')
+        api_key = os.environ.get('d931005e1f7146579ad649d934b65421', '')
         if api_key:
             api_url = f"https://iban.abstractapi.com/v1/?api_key={api_key}&iban={iban_clean}"
             response = requests.get(api_url, timeout=3)
