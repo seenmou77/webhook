@@ -23,156 +23,119 @@ upload_stats = {
 }
 
 def detect_bank_from_iban(iban):
-    """Détecte automatiquement la banque à partir de l'IBAN français"""
+    """Détecte automatiquement la banque à partir de l'IBAN via API"""
     if not iban or len(iban) < 14:
         return "N/A"
     
     # Nettoyer l'IBAN (supprimer espaces et tirets)
     iban_clean = iban.replace(' ', '').replace('-', '').upper()
     
-    # Vérifier que c'est un IBAN français
-    if not iban_clean.startswith('FR'):
-        return "Banque étrangère"
+    # Fallback local pour validation basique
+    def fallback_detection(iban_clean):
+        if not iban_clean.startswith('FR'):
+            return "Banque étrangère"
+        
+        try:
+            code_banque = iban_clean[4:9]
+            basic_banks = {
+                '10907': 'BNP Paribas', '30004': 'BNP Paribas',
+                '30003': 'Société Générale', '30002': 'Crédit Agricole',
+                '20041': 'La Banque Postale', '30056': 'BRED',
+                '10278': 'Crédit Mutuel', '10906': 'CIC',
+                '16798': 'ING Direct', '12548': 'Boursorama'
+            }
+            return basic_banks.get(code_banque, f"Banque française (code: {code_banque})")
+        except:
+            return "IBAN invalide"
     
+    # Tentative 1: API ibanapi.com (gratuite)
     try:
-        # Extraire le code banque (positions 4 à 9 dans l'IBAN français)
-        code_banque = iban_clean[4:9]
+        api_url = f"https://openiban.com/validate/{iban_clean}?getBIC=true"
+        response = requests.get(api_url, timeout=3)
         
-        # Dictionnaire des codes banque français principaux
-        bank_codes = {
-            # Grandes banques nationales
-            '30002': 'Crédit Agricole',
-            '30003': 'Crédit Agricole',
-            '30004': 'Crédit Agricole',
-            '30056': 'BRED Banque Populaire',
-            '10907': 'BNP Paribas',
-            '30004': 'BNP Paribas',
-            '14707': 'Banque Populaire',
-            '10278': 'Crédit Mutuel',
-            '10278': 'CIC',
-            '20041': 'Banque Postale',
-            '30003': 'Société Générale',
-            '30003': 'Crédit du Nord',
-            
-            # BNP Paribas et filiales
-            '30004': 'BNP Paribas',
-            '10907': 'BNP Paribas',
-            '18206': 'BNP Paribas',
-            
-            # Société Générale et filiales
-            '30003': 'Société Générale',
-            '30003': 'Crédit du Nord',
-            
-            # Crédit Agricole
-            '11315': 'Crédit Agricole Centre-Est',
-            '13315': 'Crédit Agricole Sud Rhône Alpes',
-            '12115': 'Crédit Agricole Alpes Provence',
-            '10915': 'Crédit Agricole Aquitaine',
-            '18315': 'Crédit Agricole Atlantique Vendée',
-            '11815': 'Crédit Agricole Centre France',
-            '12515': 'Crédit Agricole Centre Loire',
-            '16915': 'Crédit Agricole Centre Ouest',
-            '11715': 'Crédit Agricole Charente-Maritime Deux-Sèvres',
-            '15215': 'Crédit Agricole Charente-Périgord',
-            '19715': 'Crédit Agricole Corse',
-            '13815': 'Crédit Agricole des Savoie',
-            '14015': 'Crédit Agricole du Finistère',
-            '15515': 'Crédit Agricole du Languedoc',
-            '10115': 'Crédit Agricole du Morbihan',
-            '14715': 'Crédit Agricole Ille-et-Vilaine',
-            '17115': 'Crédit Agricole Loire Haute-Loire',
-            '16515': 'Crédit Agricole Lorraine',
-            '17515': 'Crédit Agricole Midi Pyrénées',
-            '13015': 'Crédit Agricole Nord de France',
-            '18715': 'Crédit Agricole Nord Est',
-            '10715': 'Crédit Agricole Normandie',
-            '17915': 'Crédit Agricole Normandie-Seine',
-            '15815': 'Crédit Agricole Pyrénées Gascogne',
-            '12815': 'Crédit Agricole Sud Méditerranée',
-            '14415': 'Crédit Agricole Touraine Poitou',
-            
-            # Banques Populaires
-            '14707': 'Banque Populaire Alsace Lorraine Champagne',
-            '17807': 'Banque Populaire Aquitaine Centre Atlantique',
-            '12807': 'Banque Populaire Auvergne Rhône Alpes',
-            '13807': 'Banque Populaire Bourgogne Franche-Comté',
-            '16307': 'Banque Populaire Grand Ouest',
-            '15207': 'Banque Populaire Méditerranée',
-            '16607': 'Banque Populaire Nord',
-            '18307': 'Banque Populaire Occitane',
-            '18407': 'Banque Populaire Provençale et Corse',
-            '10207': 'Banque Populaire Rives de Paris',
-            '14507': 'Banque Populaire Val de France',
-            
-            # Crédit Mutuel et CIC
-            '10278': 'Crédit Mutuel',
-            '10906': 'CIC',
-            '30006': 'CIC',
-            '10096': 'CIC Est',
-            '20096': 'CIC Iberbanco',
-            '10846': 'CIC Lyonnaise de Banque',
-            '11906': 'CIC Nord Ouest',
-            '30066': 'CIC Ouest',
-            
-            # Banques en ligne et néo-banques
-            '16798': 'ING Direct',
-            '12548': 'Boursorama',
-            '14469': 'Monabanq',
-            '17515': 'Hello Bank',
-            '10907': 'Hello Bank (BNP)',
-            
-            # Banques spécialisées
-            '30056': 'BRED',
-            '20041': 'La Banque Postale',
-            '15589': 'LCL',
-            '30002': 'LCL',
-            '13369': 'Caisse d\'Épargne',
-            '17906': 'Caisse d\'Épargne',
-            
-            # Banques régionales
-            '20815': 'Banque de Savoie',
-            '20845': 'Banque Rhône-Alpes',
-            '14559': 'Banque Tarneaud',
-            '13489': 'Crédit Coopératif',
-            
-            # Banques professionnelles
-            '30027': 'Banque Palatine',
-            '18829': 'Banque Kolb',
-            '16229': 'Banque Nuger',
-            '17729': 'Banque de l\'Union Européenne',
-        }
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('valid'):
+                bank_data = data.get('bankData', {})
+                bank_name = bank_data.get('name', '')
+                if bank_name:
+                    print(f"🌐 API OpenIBAN: {bank_name}")
+                    return f"🌐 {bank_name}"
+    except Exception as e:
+        print(f"⚠️ Erreur API OpenIBAN: {str(e)}")
+    
+    # Tentative 2: API iban-validator.com
+    try:
+        api_url = "https://api.iban-validator.com/iban"
+        headers = {"Content-Type": "application/json"}
+        payload = {"iban": iban_clean}
         
-        # Recherche directe du code
-        if code_banque in bank_codes:
-            return bank_codes[code_banque]
+        response = requests.post(api_url, json=payload, headers=headers, timeout=3)
         
-        # Recherche par patterns pour les groupes
-        if code_banque.startswith('100') or code_banque.startswith('102'):
-            return 'Crédit Mutuel / CIC'
-        elif code_banque.startswith('109'):
-            return 'BNP Paribas'
-        elif code_banque.startswith('300'):
-            if code_banque.startswith('30003'):
-                return 'Société Générale'
-            elif code_banque.startswith('30004'):
-                return 'BNP Paribas'
-            elif code_banque.startswith('30002'):
-                return 'Crédit Agricole'
-            else:
-                return 'Société Générale (groupe)'
-        elif code_banque.endswith('15'):
-            return 'Crédit Agricole (région)'
-        elif code_banque.endswith('07'):
-            return 'Banque Populaire (région)'
-        elif code_banque.startswith('200'):
-            return 'La Banque Postale'
-        elif code_banque.startswith('139') or code_banque.startswith('179'):
-            return 'Caisse d\'Épargne'
-        else:
-            return f"Banque française (code: {code_banque})"
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('valid'):
+                bank_name = data.get('bank', {}).get('name', '')
+                if bank_name:
+                    print(f"🌐 API IBAN-Validator: {bank_name}")
+                    return f"🌐 {bank_name}"
+    except Exception as e:
+        print(f"⚠️ Erreur API IBAN-Validator: {str(e)}")
+    
+    # Tentative 3: API abstractapi.com (gratuite avec limite)
+    try:
+        # Clé API gratuite - remplacez par votre clé si vous en avez une
+        api_key = os.environ.get('ABSTRACT_API_KEY', '')
+        if api_key:
+            api_url = f"https://iban.abstractapi.com/v1/?api_key={api_key}&iban={iban_clean}"
+            response = requests.get(api_url, timeout=3)
             
-    except (ValueError, IndexError):
-        return "IBAN invalide"
+            if response.status_code == 200:
+                data = response.json()
+                bank_name = data.get('bank', {}).get('name', '')
+                if bank_name:
+                    print(f"🌐 API AbstractAPI: {bank_name}")
+                    return f"🌐 {bank_name}"
+    except Exception as e:
+        print(f"⚠️ Erreur API AbstractAPI: {str(e)}")
+    
+    # Tentative 4: API IBAN4U (gratuite avec limite)
+    try:
+        api_url = f"https://api.iban4u.com/v2/validate/{iban_clean}"
+        response = requests.get(api_url, timeout=3)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('valid'):
+                bank_name = data.get('bank_name', '')
+                if bank_name:
+                    print(f"🌐 API IBAN4U: {bank_name}")
+                    return f"🌐 {bank_name}"
+    except Exception as e:
+        print(f"⚠️ Erreur API IBAN4U: {str(e)}")
+    
+    # Fallback: détection locale si toutes les APIs échouent
+    print(f"🔄 Fallback: détection locale pour {iban_clean}")
+    return f"📍 {fallback_detection(iban_clean)}"
+
+def detect_bank_with_cache(iban):
+    """Détection avec cache pour éviter les appels API répétés"""
+    if not hasattr(detect_bank_with_cache, 'cache'):
+        detect_bank_with_cache.cache = {}
+    
+    iban_clean = iban.replace(' ', '').replace('-', '').upper()
+    
+    # Vérifier le cache
+    if iban_clean in detect_bank_with_cache.cache:
+        print(f"💾 Cache hit pour {iban_clean}")
+        return detect_bank_with_cache.cache[iban_clean]
+    
+    # Appel API
+    result = detect_bank_from_iban(iban)
+    
+    # Stocker en cache
+    detect_bank_with_cache.cache[iban_clean] = result
+    return result
 
 def load_clients_from_csv(file_content):
     """Charge les clients depuis un contenu CSV"""
@@ -217,7 +180,7 @@ def load_clients_from_csv(file_content):
                 # Détection automatique de la banque si pas renseignée
                 banque = normalized_row.get('banque', '')
                 if not banque and iban:
-                    banque = detect_bank_from_iban(iban)
+                    banque = detect_bank_with_cache(iban)
                     print(f"🏦 Banque détectée automatiquement pour {telephone}: {banque}")
                 elif not banque:
                     banque = 'N/A'
@@ -345,7 +308,12 @@ def format_client_message(client_info, context="appel"):
         # Emoji spécial pour banque détectée automatiquement
         banque_display = client_info.get('banque', 'N/A')
         if banque_display not in ['N/A', ''] and client_info.get('iban'):
-            banque_display = f"🤖 {banque_display} (auto-détectée)"
+            if banque_display.startswith('🌐'):
+                banque_display = f"{banque_display} (API)"
+            elif banque_display.startswith('📍'):
+                banque_display = f"{banque_display} (local)"
+            else:
+                banque_display = f"🤖 {banque_display} (auto-détectée)"
         
         return f"""
 {emoji_statut} <b>APPEL ENTRANT</b>
@@ -382,7 +350,12 @@ def format_client_message(client_info, context="appel"):
         # Emoji spécial pour banque détectée automatiquement
         banque_display = client_info.get('banque', 'N/A')
         if banque_display not in ['N/A', ''] and client_info.get('iban'):
-            banque_display = f"🤖 {banque_display} (auto-détectée)"
+            if banque_display.startswith('🌐'):
+                banque_display = f"{banque_display} (API)"
+            elif banque_display.startswith('📍'):
+                banque_display = f"{banque_display} (local)"
+            else:
+                banque_display = f"🤖 {banque_display} (auto-détectée)"
             
         return f"""
 📋 <b>RÉSULTAT TROUVÉ :</b>
@@ -433,14 +406,14 @@ def process_telegram_command(message_text, chat_id):
             
         elif message_text.startswith('/iban '):
             iban = message_text.replace('/iban ', '').strip()
-            detected_bank = detect_bank_from_iban(iban)
+            detected_bank = detect_bank_with_cache(iban)
             response_message = f"""
-🏦 <b>ANALYSE IBAN</b>
+🏦 <b>ANALYSE IBAN VIA API</b>
 
 💳 IBAN: <code>{iban}</code>
 🏛️ Banque détectée: <b>{detected_bank}</b>
 
-🤖 <i>Détection automatique basée sur le code banque français</i>
+🌐 <i>Détection via APIs externes avec fallback local</i>
             """
             send_telegram_message(response_message)
             return {"status": "iban_analyzed", "iban": iban, "bank": detected_bank}
@@ -481,7 +454,7 @@ def process_telegram_command(message_text, chat_id):
 ✅ <b>Le bot reçoit automatiquement:</b>
 ▪️ Les appels entrants OVH
 ▪️ Les notifications en temps réel
-▪️ 🤖 Détection automatique des banques depuis IBAN
+▪️ 🌐 Détection automatique des banques via APIs IBAN
             """
             send_telegram_message(help_message)
             return {"status": "help_sent"}
@@ -608,7 +581,7 @@ def home():
             <h1>🤖 Webhook OVH-Telegram</h1>
             <p class="success">✅ Serveur Railway actif 24/7 - Bot configuré</p>
             <div class="new-feature">
-                <strong>🆕 NOUVELLE FONCTIONNALITÉ :</strong> 🏦 Détection automatique de la banque à partir de l'IBAN français !
+                <strong>🆕 NOUVELLE FONCTIONNALITÉ :</strong> 🌐 Détection automatique de la banque via APIs IBAN externes !
             </div>
         </div>
 
@@ -642,7 +615,7 @@ def home():
                         <li><strong>Divers:</strong> statut, situation_familiale</li>
                     </ul>
                     <div class="new-feature" style="margin-top: 10px;">
-                        <strong>🤖 AUTO-DÉTECTION BANQUE :</strong> Si la colonne <code>banque</code> est vide mais qu'un <code>iban</code> français est présent, la banque sera automatiquement détectée !
+                        <strong>🌐 AUTO-DÉTECTION BANQUE VIA API :</strong> Si la colonne <code>banque</code> est vide mais qu'un <code>iban</code> est présent, la banque sera automatiquement détectée via APIs externes !
                     </div>
                 </div>
                 <input type="file" name="file" accept=".csv" required style="margin: 10px 0;">
@@ -680,7 +653,7 @@ def home():
             <h3>🎯 Comment ça marche :</h3>
             <ol>
                 <li>📂 Uploadez votre fichier CSV avec les clients</li>
-                <li>🏦 Les banques sont automatiquement détectées depuis les IBAN français</li>
+                <li>🌐 Les banques sont automatiquement détectées via APIs IBAN externes</li>
                 <li>📞 Configurez l'URL OVH CTI</li>
                 <li>✅ Chaque appel entrant affiche automatiquement la fiche client dans Telegram</li>
                 <li>🔍 Utilisez <code>/numero XXXXXXXXXX</code> pour rechercher un client</li>
@@ -913,24 +886,26 @@ def test_command():
 
 @app.route('/test-iban')
 def test_iban():
-    """Test de la détection d'IBAN"""
+    """Test de la détection d'IBAN via API"""
     test_ibans = [
         "FR1420041010050500013M02606",  # La Banque Postale
         "FR7630003000540000000001234",  # Société Générale
         "FR1411315000100000000000000",  # Crédit Agricole
         "FR7610907000000000000000000",  # BNP Paribas
         "FR7617206000000000000000000",  # BRED
+        "DE89370400440532013000",       # Deutsche Bank (test étranger)
     ]
     
     results = []
     for iban in test_ibans:
-        bank = detect_bank_from_iban(iban)
+        bank = detect_bank_with_cache(iban)
         results.append({"iban": iban, "bank_detected": bank})
     
     return jsonify({
         "test_results": results,
-        "function_status": "OK",
-        "total_tests": len(test_ibans)
+        "function_status": "API-enabled with fallback",
+        "total_tests": len(test_ibans),
+        "cache_size": len(getattr(detect_bank_with_cache, 'cache', {}))
     })
 
 @app.route('/test-ovh-cgi')
@@ -965,7 +940,7 @@ def health():
         "service": "webhook-ovh-telegram",
         "telegram_configured": bool(TELEGRAM_TOKEN and CHAT_ID),
         "clients_loaded": upload_stats["total_clients"],
-        "iban_detection": "enabled",
+        "iban_detection": "API-enabled with fallback",
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
 
