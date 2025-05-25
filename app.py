@@ -1875,6 +1875,147 @@ def quick_fix_csi_method():
 
 # Appliquer le fix au démarrage
 quick_fix_csi_method()
+
+# 🔧 PATCH RAPIDE - Ajoutez ceci à la fin de votre app.py existant
+
+def get_csi_token_fixed():
+    """Version corrigée de get_csi_token avec URL /manager/ et domain_masks"""
+    global keyyo_csi_token
+    
+    if not keyyo_access_token:
+        print("❌ Pas d'access token disponible")
+        return None
+    
+    headers = {
+        'Authorization': f'Bearer {keyyo_access_token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+    
+    try:
+        # 1. Récupérer les services
+        print("🔍 Récupération des services...")
+        services_response = requests.get('https://api.keyyo.com/1.0/services', headers=headers, timeout=10)
+        
+        if services_response.status_code != 200:
+            print(f"❌ Erreur services: {services_response.status_code} - {services_response.text}")
+            return None
+        
+        services_data = services_response.json()
+        print(f"✅ Services récupérés: {json.dumps(services_data, indent=2)}")
+        
+        # 2. Extraire le CSI
+        if 'services' in services_data:
+            services_dict = services_data['services']
+        elif isinstance(services_data, dict):
+            services_dict = services_data
+        else:
+            print("❌ Format services non reconnu")
+            return None
+        
+        if not services_dict:
+            print("❌ Aucun service trouvé")
+            return None
+        
+        csi_id = list(services_dict.keys())[0]
+        print(f"🎯 CSI sélectionné: {csi_id}")
+        
+        # 3. Générer CSI token avec URL CORRIGÉE
+        csi_token_url = f'https://api.keyyo.com/manager/1.0/services/{csi_id}/csi_token'
+        print(f"🚀 URL CORRIGÉE: {csi_token_url}")
+        
+        # Tentative 1: Avec domain_masks
+        payload = {'domain_masks': ['*.up.railway.app', 'web-production-95ca.up.railway.app']}
+        print(f"🔄 Tentative avec payload: {payload}")
+        
+        response = requests.post(csi_token_url, headers=headers, json=payload, timeout=10)
+        print(f"📊 Status avec payload: {response.status_code}")
+        print(f"📊 Response avec payload: {response.text}")
+        
+        if response.status_code == 200:
+            try:
+                csi_data = response.json()
+                for field in ['csi_token', 'token', 'access_token', 'cti_token']:
+                    if field in csi_data and csi_data[field]:
+                        keyyo_csi_token = csi_data[field]
+                        print(f"✅ CSI Token trouvé dans '{field}': {keyyo_csi_token[:20]}...")
+                        return keyyo_csi_token
+            except:
+                if len(response.text.strip()) > 10:
+                    keyyo_csi_token = response.text.strip()
+                    print(f"✅ CSI Token (texte): {keyyo_csi_token[:20]}...")
+                    return keyyo_csi_token
+        
+        # Tentative 2: Sans payload
+        print("🔄 Tentative sans payload...")
+        response2 = requests.post(csi_token_url, headers=headers, timeout=10)
+        print(f"📊 Status sans payload: {response2.status_code}")
+        print(f"📊 Response sans payload: {response2.text}")
+        
+        if response2.status_code == 200:
+            try:
+                csi_data = response2.json()
+                for field in ['csi_token', 'token', 'access_token']:
+                    if field in csi_data and csi_data[field]:
+                        keyyo_csi_token = csi_data[field]
+                        print(f"✅ CSI Token trouvé: {keyyo_csi_token[:20]}...")
+                        return keyyo_csi_token
+            except:
+                if len(response2.text.strip()) > 10:
+                    keyyo_csi_token = response2.text.strip()
+                    return keyyo_csi_token
+        
+        print(f"❌ Échec des deux tentatives")
+        return None
+        
+    except Exception as e:
+        print(f"❌ Erreur: {str(e)}")
+        return None
+
+# Remplacer l'ancienne fonction
+get_csi_token = get_csi_token_fixed
+
+@app.route('/test-oauth-quick')
+def test_oauth_quick():
+    """Test rapide avec votre code OAuth2"""
+    global keyyo_access_token, keyyo_csi_token
+    
+    # Réinitialiser
+    keyyo_access_token = None
+    keyyo_csi_token = None
+    
+    # Code reçu dans votre URL
+    test_code = "e457e407714dad048a8d54ef11319d377a18bf4c"
+    
+    print(f"🧪 Test avec code: {test_code}")
+    
+    # Échanger le code
+    success = exchange_code_for_token(test_code)
+    
+    if success:
+        print("✅ Access token récupéré, test génération CSI...")
+        csi_token = get_csi_token_fixed()
+        
+        return jsonify({
+            "oauth_success": True,
+            "access_token": keyyo_access_token[:20] + "..." if keyyo_access_token else None,
+            "csi_success": csi_token is not None,
+            "csi_token": csi_token[:20] + "..." if csi_token else None,
+            "full_csi_token": csi_token,  # Pour copier-coller
+            "status": "SUCCESS" if csi_token else "CSI_FAILED"
+        })
+    else:
+        return jsonify({
+            "oauth_success": False,
+            "error": "Échec échange OAuth2"
+        })
+
+@app.route('/test-new-oauth')
+def test_new_oauth():
+    """Générer un nouveau code OAuth2"""
+    return redirect(get_keyyo_auth_url())
+
+print("🔧 Patch appliqué ! Testez sur /test-oauth-quick")
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Démarrage de l'application sur le port {port}")
