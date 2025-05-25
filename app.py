@@ -5,25 +5,541 @@ import requests
 import csv
 import io
 import base64
+import time
+import re
 from datetime import datetime
 from werkzeug.utils import secure_filename
 from urllib.parse import urlencode, quote_plus, urlparse, parse_qs
+from functools import wraps
+import logging
+
+# ===================================================================
+# CONFIGURATION ET LOGGING
+# ===================================================================
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Removed FileHandler for Railway compatibility
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = 'webhook-ovh-secret-key'
 
-# Configuration Telegram
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '7822148813:AAEhWJWToLUY5heVP1G_yqM1Io-vmAMlbLg')
-CHAT_ID = os.environ.get('CHAT_ID', '-1002652961145')
+# Configuration centralisée
+class Config:
+    # Telegram
+    TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '7822148813:AAEhWJWToLUY5heVP1G_yqM1Io-vmAMlbLg')
+    CHAT_ID = os.environ.get('CHAT_ID', '-1002652961145')
+    
+    # Keyyo OAuth2
+    KEYYO_CLIENT_ID = os.environ.get('KEYYO_CLIENT_ID', '6832980609dd1')
+    KEYYO_CLIENT_SECRET = os.environ.get('KEYYO_CLIENT_SECRET', '3ce3ff3d62c261c079b66e9a')
+    KEYYO_REDIRECT_URI = 'https://web-production-95ca.up.railway.app/oauth/keyyo/callback'
+    
+    # APIs IBAN
+    ABSTRACT_API_KEY = os.environ.get('ABSTRACT_API_KEY', 'd931005e1f7146579ad649d934b65421')
 
-# Configuration OAuth2 Keyyo
-KEYYO_CLIENT_ID = os.environ.get('KEYYO_CLIENT_ID', '6832980609dd1')
-KEYYO_CLIENT_SECRET = os.environ.get('KEYYO_CLIENT_SECRET', '3ce3ff3d62c261c079b66e9a')
-KEYYO_REDIRECT_URI = 'https://web-production-95ca.up.railway.app/oauth/keyyo/callback'
+app.config.from_object(Config)
 
-# Variables globales pour Keyyo
-keyyo_access_token = None
-keyyo_csi_token = None
+# ===================================================================
+# CACHE ET RATE LIMITING
+# ===================================================================
+
+class SimpleCache:
+    def __init__(self):
+        self.cache = {}
+        self.timestamps = {}
+    
+    def get(self, key, ttl=3600):
+        if key in self.cache:
+            if time.time() - self.timestamps.get(key, 0) < ttl:
+                return self.cache[key]
+            else:
+                # Expired
+                del self.cache[key]
+                if key in self.timestamps:
+                    del self.timestamps[key]
+        return None
+    
+    def set(self, key, value):
+        self.cache[key] = value
+        self.timestamps[key] = time.time()
+    
+    def clear(self):
+        self.cache.clear()
+        self.timestamps.clear()
+
+# Cache global
+cache = SimpleCache()
+
+def rate_limit(calls_per_minute=30):
+    """Rate limiting decorator"""
+    def decorator(func):
+        calls = []
+        
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            # Nettoyer les appels anciens
+            calls[:] = [call_time for call_time in calls if now - call_time < 60]
+            
+            if len(calls) >= calls_per_minute:
+                logger.warning("Rate limit exceeded")
+                raise Exception("Rate limit exceeded")
+            
+            calls.append(now)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# ===================================================================
+# SERVICE DÉTECTION IBAN AMÉLIORÉ
+# ===================================================================
+
+class IBANDetector:
+    def __init__(self):
+        self.local_banks = {
+            '10907': 'BNP Paribas', '30004': 'BNP Paribas',
+            '30003': 'Société Générale', '30002': 'Crédit Agricole',
+            '20041': 'La Banque Postale', '30056': 'BRED',
+            '10278': 'Crédit Mutuel', '10906': 'CIC',
+            '16798': 'ING Direct', '12548': 'Boursorama',
+            '30027': 'Crédit Coopératif', '10011': 'BNP Paribas Fortis',
+            '17515': 'Monabanq', '18206': 'N26'
+        }
+    
+    def clean_iban(self, iban):
+        """Nettoie l'IBAN"""
+        if not iban:
+            return ""
+        return iban.replace(' ', '').replace('-', '').upper()
+    
+    def detect_local(self, iban_clean):
+        """Détection locale basique"""
+        if not iban_clean.startswith('FR'):
+            return "Banque étrangère"
+        
+        if len(iban_clean) < 14:
+            return "IBAN invalide"
+        
+        try:
+            code_banque = iban_clean[4:9]
+            return self.local_banks.get(code_banque, f"Banque française (code: {code_banque})")
+        except:
+            return "IBAN invalide"
+    
+    def detect_with_api(self, iban_clean):
+        """Détection via APIs externes avec timeout court"""
+        # Vérifier cache d'abord
+        cache_key = f"iban:{iban_clean}"
+        cached_result = cache.get(cache_key, ttl=86400)  # Cache 24h
+        if cached_result:
+            logger.info(f"💾 Cache hit pour IBAN: {iban_clean}")
+            return cached_result
+        
+        # API OpenIBAN
+        try:
+            response = requests.get(
+                f"https://openiban.com/validate/{iban_clean}?getBIC=true",
+                timeout=3
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('valid'):
+                    bank_name = data.get('bankData', {}).get('name', '')
+                    if bank_name:
+                        result = f"🌐 {bank_name}"
+                        cache.set(cache_key, result)
+                        logger.info(f"✅ API OpenIBAN: {bank_name}")
+                        return result
+        except Exception as e:
+            logger.debug(f"⚠️ Erreur API OpenIBAN: {str(e)}")
+        
+        # API IBAN4U
+        try:
+            response = requests.get(
+                f"https://api.iban4u.com/v2/validate/{iban_clean}",
+                timeout=3
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('valid'):
+                    bank_name = data.get('bank_name', '')
+                    if bank_name:
+                        result = f"🌐 {bank_name}"
+                        cache.set(cache_key, result)
+                        logger.info(f"✅ API IBAN4U: {bank_name}")
+                        return result
+        except Exception as e:
+            logger.debug(f"⚠️ Erreur API IBAN4U: {str(e)}")
+        
+        # API AbstractAPI (si clé disponible)
+        if Config.ABSTRACT_API_KEY:
+            try:
+                response = requests.get(
+                    f"https://iban.abstractapi.com/v1/?api_key={Config.ABSTRACT_API_KEY}&iban={iban_clean}",
+                    timeout=3
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    bank_name = data.get('bank', {}).get('name', '')
+                    if bank_name:
+                        result = f"🌐 {bank_name}"
+                        cache.set(cache_key, result)
+                        logger.info(f"✅ API AbstractAPI: {bank_name}")
+                        return result
+            except Exception as e:
+                logger.debug(f"⚠️ Erreur API AbstractAPI: {str(e)}")
+        
+        return None
+    
+    def detect_bank(self, iban):
+        """Détection principale avec fallback"""
+        if not iban:
+            return "N/A"
+        
+        iban_clean = self.clean_iban(iban)
+        if not iban_clean:
+            return "N/A"
+        
+        # Tentative API
+        api_result = self.detect_with_api(iban_clean)
+        if api_result:
+            return api_result
+        
+        # Fallback local
+        local_result = f"📍 {self.detect_local(iban_clean)}"
+        logger.info(f"🔄 Fallback local pour {iban_clean}: {local_result}")
+        return local_result
+
+# Instance globale
+iban_detector = IBANDetector()
+
+# ===================================================================
+# CLIENT KEYYO AMÉLIORÉ
+# ===================================================================
+
+class KeyyoClient:
+    def __init__(self, client_id, client_secret, redirect_uri):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.access_token = None
+        self.csi_token = None
+    
+    def get_auth_url(self):
+        """Génère l'URL d'autorisation OAuth2"""
+        auth_params = {
+            'response_type': 'code',
+            'client_id': self.client_id,
+            'redirect_uri': self.redirect_uri,
+            'scope': 'cti_admin full_access_read_only',
+            'state': 'webhook_telegram_cti'
+        }
+        return f"https://ssl.keyyo.com/oauth2/authorize.php?{urlencode(auth_params)}"
+    
+    def exchange_code_for_token(self, auth_code):
+        """Échange le code contre un access token - VERSION CORRIGÉE RFC 6749"""
+        # Encoder correctement les credentials selon RFC 6749 Section 2.3.1
+        client_id_encoded = quote_plus(self.client_id)
+        client_secret_encoded = quote_plus(self.client_secret)
+        credentials_string = f"{client_id_encoded}:{client_secret_encoded}"
+        credentials = base64.b64encode(credentials_string.encode()).decode()
+        
+        headers = {
+            'Authorization': f'Basic {credentials}',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json'
+        }
+        
+        data = {
+            'grant_type': 'authorization_code',
+            'code': auth_code,
+            'redirect_uri': self.redirect_uri
+        }
+        
+        logger.info(f"🔍 OAuth2 Exchange - URL: https://api.keyyo.com/oauth2/token.php")
+        logger.info(f"🔍 Client ID: {self.client_id}")
+        logger.info(f"🔍 Redirect URI: {self.redirect_uri}")
+        
+        try:
+            response = requests.post(
+                'https://api.keyyo.com/oauth2/token.php',
+                headers=headers,
+                data=data,
+                timeout=30
+            )
+            
+            logger.info(f"🔍 OAuth2 Response - Status: {response.status_code}")
+            logger.info(f"🔍 OAuth2 Response - Content: {response.text}")
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data['access_token']
+                logger.info(f"✅ Access token récupéré: {self.access_token[:20]}...")
+                return True
+            else:
+                logger.error(f"❌ Erreur OAuth2: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Erreur OAuth2: {str(e)}")
+            return False
+    
+    def get_services(self):
+        """Récupère la liste des services disponibles"""
+        if not self.access_token:
+            logger.error("❌ Pas d'access token disponible")
+            return None
+        
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        try:
+            logger.info("🔍 Récupération de la liste des services...")
+            response = requests.get(
+                'https://api.keyyo.com/1.0/services',
+                headers=headers,
+                timeout=10
+            )
+            
+            logger.info(f"📊 Services Status: {response.status_code}")
+            logger.info(f"📊 Services Response: {response.text}")
+            
+            if response.status_code == 200:
+                services_data = response.json()
+                logger.info(f"✅ Services récupérés: {json.dumps(services_data, indent=2)}")
+                return services_data
+            else:
+                logger.error(f"❌ Erreur services: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Erreur récupération services: {str(e)}")
+            return None
+    
+    def generate_csi_token(self):
+        """
+        Génère le CSI token - VERSION CORRIGÉE basée sur la documentation
+        URL documentée: POST https://api.keyyo.com/1.0/services/:csi/csi_token
+        """
+        if not self.access_token:
+            logger.error("❌ Pas d'access token disponible")
+            return None
+        
+        # 1. Récupérer les services d'abord
+        services_data = self.get_services()
+        if not services_data:
+            return None
+        
+        # 2. Extraire le premier CSI disponible
+        if 'services' in services_data:
+            services_dict = services_data['services']
+        elif isinstance(services_data, dict):
+            services_dict = services_data
+        else:
+            logger.error("❌ Format de services non reconnu")
+            return None
+        
+        if not services_dict:
+            logger.error("❌ Aucun service trouvé")
+            return None
+        
+        # Prendre le premier CSI
+        csi_id = list(services_dict.keys())[0]
+        logger.info(f"🎯 CSI sélectionné: {csi_id}")
+        
+        # 3. Générer le CSI token via l'endpoint documenté
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        # URL selon la documentation fournie
+        csi_token_url = f'https://api.keyyo.com/1.0/services/{csi_id}/csi_token'
+        logger.info(f"🚀 Génération CSI token via: {csi_token_url}")
+        
+        try:
+            # POST request selon la documentation
+            response = requests.post(
+                csi_token_url,
+                headers=headers,
+                timeout=10
+            )
+            
+            logger.info(f"📊 CSI Status: {response.status_code}")
+            logger.info(f"📊 CSI Response: {response.text}")
+            logger.info(f"📊 CSI Headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                try:
+                    # Essayer de parser en JSON
+                    csi_data = response.json()
+                    logger.info(f"📋 CSI Data (JSON): {json.dumps(csi_data, indent=2)}")
+                    
+                    # Chercher le token dans différents champs possibles
+                    token_fields = ['csi_token', 'token', 'access_token', 'cti_token']
+                    
+                    for field in token_fields:
+                        if field in csi_data and csi_data[field]:
+                            self.csi_token = csi_data[field]
+                            logger.info(f"✅ CSI Token trouvé dans '{field}': {self.csi_token[:20]}...")
+                            return self.csi_token
+                    
+                    logger.error(f"❌ Token non trouvé dans les champs: {list(csi_data.keys())}")
+                    return None
+                    
+                except json.JSONDecodeError:
+                    # La réponse pourrait être directement le token en texte brut
+                    token_text = response.text.strip()
+                    if token_text and len(token_text) > 10:  # Token minimum viable
+                        self.csi_token = token_text
+                        logger.info(f"✅ CSI Token (texte brut): {self.csi_token[:20]}...")
+                        return self.csi_token
+                    else:
+                        logger.error(f"❌ Réponse texte non valide: '{token_text}'")
+                        return None
+            
+            elif response.status_code == 401:
+                logger.error("❌ Token d'accès invalide ou expiré")
+                return None
+            elif response.status_code == 403:
+                logger.error("❌ Permissions insuffisantes - vérifiez les scopes OAuth2")
+                return None
+            elif response.status_code == 404:
+                logger.error(f"❌ Service CSI '{csi_id}' non trouvé - vérifiez l'ID")
+                return None
+            else:
+                logger.error(f"❌ Erreur HTTP {response.status_code}: {response.text}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logger.error("❌ Timeout lors de la requête CSI token")
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.error("❌ Erreur de connexion à l'API Keyyo")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Erreur inattendue: {str(e)}")
+            return None
+    
+    def test_api(self):
+        """Test de l'API Keyyo avec le token actuel"""
+        if not self.access_token:
+            return {"error": "Pas d'access token"}
+        
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            response = requests.get('https://api.keyyo.com/1.0/services', headers=headers, timeout=5)
+            return {
+                "status_code": response.status_code,
+                "response": response.json() if response.status_code == 200 else response.text
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+# Instance globale Keyyo
+keyyo_client = KeyyoClient(
+    Config.KEYYO_CLIENT_ID,
+    Config.KEYYO_CLIENT_SECRET,
+    Config.KEYYO_REDIRECT_URI
+)
+
+# ===================================================================
+# SERVICE TELEGRAM AMÉLIORÉ
+# ===================================================================
+
+class TelegramService:
+    def __init__(self, token, chat_id):
+        self.token = token
+        self.chat_id = chat_id
+    
+    @rate_limit(calls_per_minute=30)
+    def send_message(self, message):
+        """Envoie un message vers Telegram avec rate limiting"""
+        try:
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            data = {
+                'chat_id': self.chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, data=data, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info("✅ Message Telegram envoyé")
+                return response.json()
+            else:
+                logger.error(f"❌ Erreur Telegram: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Erreur Telegram: {str(e)}")
+            return None
+    
+    def format_client_message(self, client_info, context="appel"):
+        """Formate un message client pour Telegram"""
+        emoji_statut = "📞" if client_info['statut'] != "Non référencé" else "❓"
+        
+        # Emoji spécial pour banque détectée automatiquement
+        banque_display = client_info.get('banque', 'N/A')
+        if banque_display not in ['N/A', ''] and client_info.get('iban'):
+            if banque_display.startswith('🌐'):
+                banque_display = f"{banque_display} (API)"
+            elif banque_display.startswith('📍'):
+                banque_display = f"{banque_display} (local)"
+        
+        return f"""
+{emoji_statut} <b>{'APPEL ENTRANT' if context == 'appel' else 'RECHERCHE'}</b>
+📞 Numéro: <code>{client_info['telephone']}</code>
+🕐 Heure: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+
+👤 <b>IDENTITÉ</b>
+▪️ Nom: <b>{client_info['nom']}</b>
+▪️ Prénom: <b>{client_info['prenom']}</b>
+👥 Sexe: {client_info.get('sexe', 'N/A')}
+🎂 Date de naissance: {client_info.get('date_naissance', 'N/A')}
+📍 Lieu de naissance: {client_info.get('lieu_naissance', 'N/A')}
+
+🏢 <b>PROFESSIONNEL</b>
+▪️ Entreprise: {client_info['entreprise']}
+▪️ Profession: {client_info.get('profession', 'N/A')}
+📧 Email: {client_info['email']}
+
+🏠 <b>COORDONNÉES</b>
+▪️ Adresse: {client_info['adresse']}
+▪️ Ville: {client_info['ville']} {client_info['code_postal']}
+
+🏦 <b>INFORMATIONS BANCAIRES</b>
+▪️ Banque: {banque_display}
+▪️ SWIFT: <code>{client_info.get('swift', 'N/A')}</code>
+▪️ IBAN: <code>{client_info.get('iban', 'N/A')}</code>
+
+📊 <b>CAMPAGNE</b>
+▪️ Statut: <b>{client_info['statut']}</b>
+▪️ Nb appels: {client_info['nb_appels']}
+▪️ Dernier appel: {client_info['dernier_appel'] or 'Premier appel'}
+        """
+
+# Instance globale Telegram
+telegram_service = TelegramService(Config.TELEGRAM_TOKEN, Config.CHAT_ID)
+
+# ===================================================================
+# GESTION CLIENTS ET DONNÉES
+# ===================================================================
 
 # Base de données clients en mémoire
 clients_database = {}
@@ -33,130 +549,39 @@ upload_stats = {
     "filename": None
 }
 
-def detect_bank_from_iban(iban):
-    """Détecte automatiquement la banque à partir de l'IBAN via API"""
-    if not iban or len(iban) < 14:
-        return "N/A"
+def normalize_phone(phone):
+    """Normalisation avancée des numéros de téléphone"""
+    if not phone:
+        return None
     
-    # Nettoyer l'IBAN (supprimer espaces et tirets)
-    iban_clean = iban.replace(' ', '').replace('-', '').upper()
+    # Supprimer tous les caractères non numériques sauf +
+    cleaned = re.sub(r'[^\d+]', '', str(phone))
     
-    # Fallback local pour validation basique
-    def fallback_detection(iban_clean):
-        if not iban_clean.startswith('FR'):
-            return "Banque étrangère"
-        
-        try:
-            code_banque = iban_clean[4:9]
-            basic_banks = {
-                '10907': 'BNP Paribas', '30004': 'BNP Paribas',
-                '30003': 'Société Générale', '30002': 'Crédit Agricole',
-                '20041': 'La Banque Postale', '30056': 'BRED',
-                '10278': 'Crédit Mutuel', '10906': 'CIC',
-                '16798': 'ING Direct', '12548': 'Boursorama'
-            }
-            return basic_banks.get(code_banque, f"Banque française (code: {code_banque})")
-        except:
-            return "IBAN invalide"
+    # Patterns courants
+    patterns = [
+        (r'^\+33(\d{9})$', lambda m: '0' + m.group(1)),      # +33123456789 -> 0123456789
+        (r'^33(\d{9})$', lambda m: '0' + m.group(1)),        # 33123456789 -> 0123456789
+        (r'^0(\d{9})$', lambda m: '0' + m.group(1)),         # 0123456789 -> 0123456789
+        (r'^(\d{10})$', lambda m: m.group(1)),               # 1234567890 -> 1234567890
+    ]
     
-    # Tentative 1: API ibanapi.com (gratuite)
-    try:
-        api_url = f"https://openiban.com/validate/{iban_clean}?getBIC=true"
-        response = requests.get(api_url, timeout=3)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('valid'):
-                bank_data = data.get('bankData', {})
-                bank_name = bank_data.get('name', '')
-                if bank_name:
-                    print(f"🌐 API OpenIBAN: {bank_name}")
-                    return f"🌐 {bank_name}"
-    except Exception as e:
-        print(f"⚠️ Erreur API OpenIBAN: {str(e)}")
+    for pattern, transform in patterns:
+        match = re.match(pattern, cleaned)
+        if match:
+            result = transform(match)
+            # Validation finale
+            if len(result) == 10 and result.startswith('0'):
+                return result
     
-    # Tentative 2: API iban-validator.com
-    try:
-        api_url = "https://api.iban-validator.com/iban"
-        headers = {"Content-Type": "application/json"}
-        payload = {"iban": iban_clean}
-        
-        response = requests.post(api_url, json=payload, headers=headers, timeout=3)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('valid'):
-                bank_name = data.get('bank', {}).get('name', '')
-                if bank_name:
-                    print(f"🌐 API IBAN-Validator: {bank_name}")
-                    return f"🌐 {bank_name}"
-    except Exception as e:
-        print(f"⚠️ Erreur API IBAN-Validator: {str(e)}")
-    
-    # Tentative 3: API abstractapi.com (gratuite avec limite)
-    try:
-        # Clé API gratuite - remplacez par votre clé si vous en avez une
-        api_key = os.environ.get('d931005e1f7146579ad649d934b65421', '')
-        if api_key:
-            api_url = f"https://iban.abstractapi.com/v1/?api_key={api_key}&iban={iban_clean}"
-            response = requests.get(api_url, timeout=3)
-            
-            if response.status_code == 200:
-                data = response.json()
-                bank_name = data.get('bank', {}).get('name', '')
-                if bank_name:
-                    print(f"🌐 API AbstractAPI: {bank_name}")
-                    return f"🌐 {bank_name}"
-    except Exception as e:
-        print(f"⚠️ Erreur API AbstractAPI: {str(e)}")
-    
-    # Tentative 4: API IBAN4U (gratuite avec limite)
-    try:
-        api_url = f"https://api.iban4u.com/v2/validate/{iban_clean}"
-        response = requests.get(api_url, timeout=3)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('valid'):
-                bank_name = data.get('bank_name', '')
-                if bank_name:
-                    print(f"🌐 API IBAN4U: {bank_name}")
-                    return f"🌐 {bank_name}"
-    except Exception as e:
-        print(f"⚠️ Erreur API IBAN4U: {str(e)}")
-    
-    # Fallback: détection locale si toutes les APIs échouent
-    print(f"🔄 Fallback: détection locale pour {iban_clean}")
-    return f"📍 {fallback_detection(iban_clean)}"
-
-def detect_bank_with_cache(iban):
-    """Détection avec cache pour éviter les appels API répétés"""
-    if not hasattr(detect_bank_with_cache, 'cache'):
-        detect_bank_with_cache.cache = {}
-    
-    iban_clean = iban.replace(' ', '').replace('-', '').upper()
-    
-    # Vérifier le cache
-    if iban_clean in detect_bank_with_cache.cache:
-        print(f"💾 Cache hit pour {iban_clean}")
-        return detect_bank_with_cache.cache[iban_clean]
-    
-    # Appel API
-    result = detect_bank_from_iban(iban)
-    
-    # Stocker en cache
-    detect_bank_with_cache.cache[iban_clean] = result
-    return result
+    return None
 
 def load_clients_from_csv(file_content):
-    """Charge les clients depuis un contenu CSV"""
+    """Charge les clients depuis un contenu CSV avec détection automatique banque"""
     global clients_database, upload_stats
     
     clients_database = {}
     
-    # Lecture CSV avec gestion des erreurs
     try:
-        # Utilisation du module csv de Python
         csv_reader = csv.DictReader(io.StringIO(file_content))
         
         for row in csv_reader:
@@ -171,86 +596,77 @@ def load_clients_from_csv(file_content):
             tel_columns = ['telephone', 'tel', 'phone', 'numero', 'number', 'mobile']
             for tel_key in tel_columns:
                 if tel_key in normalized_row and normalized_row[tel_key]:
-                    telephone = normalized_row[tel_key]
+                    telephone = normalize_phone(normalized_row[tel_key])
                     break
             
             if not telephone:
                 continue
-                
-            # Normalisation du numéro
-            telephone = telephone.replace(' ', '').replace('.', '').replace('-', '').replace('(', '').replace(')', '')
-            if telephone.startswith('+33'):
-                telephone = '0' + telephone[3:]
-            elif telephone.startswith('33') and len(telephone) > 10:
-                telephone = '0' + telephone[2:]
             
-            if len(telephone) >= 10 and telephone.startswith('0'):
-                # Récupération IBAN pour détection automatique banque
-                iban = normalized_row.get('iban', '')
+            # Récupération IBAN pour détection automatique banque
+            iban = normalized_row.get('iban', '')
+            
+            # Détection automatique de la banque si pas renseignée
+            banque = normalized_row.get('banque', '')
+            if not banque and iban:
+                banque = iban_detector.detect_bank(iban)
+                logger.info(f"🏦 Banque détectée automatiquement pour {telephone}: {banque}")
+            elif not banque:
+                banque = 'N/A'
+            
+            clients_database[telephone] = {
+                # Informations de base
+                "nom": normalized_row.get('nom', ''),
+                "prenom": normalized_row.get('prenom', ''),
+                "email": normalized_row.get('email', ''),
+                "entreprise": normalized_row.get('entreprise', ''),
+                "telephone": telephone,
                 
-                # Détection automatique de la banque si pas renseignée
-                banque = normalized_row.get('banque', '')
-                if not banque and iban:
-                    banque = detect_bank_with_cache(iban)
-                    print(f"🏦 Banque détectée automatiquement pour {telephone}: {banque}")
-                elif not banque:
-                    banque = 'N/A'
+                # Adresse
+                "adresse": normalized_row.get('adresse', ''),
+                "ville": normalized_row.get('ville', ''),
+                "code_postal": normalized_row.get('code_postal', ''),
                 
-                clients_database[telephone] = {
-                    # Informations de base
-                    "nom": normalized_row.get('nom', ''),
-                    "prenom": normalized_row.get('prenom', ''),
-                    "email": normalized_row.get('email', ''),
-                    "entreprise": normalized_row.get('entreprise', ''),
-                    "telephone": telephone,
-                    
-                    # Adresse
-                    "adresse": normalized_row.get('adresse', ''),
-                    "ville": normalized_row.get('ville', ''),
-                    "code_postal": normalized_row.get('code_postal', ''),
-                    
-                    # Informations bancaires (avec détection automatique)
-                    "banque": banque,
-                    "swift": normalized_row.get('swift', ''),
-                    "iban": iban,
-                    
-                    # Informations personnelles
-                    "sexe": normalized_row.get('sexe', ''),
-                    "date_naissance": normalized_row.get('date_naissance', 'Non renseigné'),
-                    "lieu_naissance": normalized_row.get('lieu_naissance', 'Non renseigné'),
-                    "profession": normalized_row.get('profession', ''),
-                    "nationalite": normalized_row.get('nationalite', ''),
-                    "situation_familiale": normalized_row.get('situation_familiale', ''),
-                    
-                    # Gestion campagne
-                    "statut": normalized_row.get('statut', 'Prospect'),
-                    "date_upload": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    "nb_appels": 0,
-                    "dernier_appel": None,
-                    "notes": ""
-                }
+                # Informations bancaires (avec détection automatique)
+                "banque": banque,
+                "swift": normalized_row.get('swift', ''),
+                "iban": iban,
+                
+                # Informations personnelles
+                "sexe": normalized_row.get('sexe', ''),
+                "date_naissance": normalized_row.get('date_naissance', 'Non renseigné'),
+                "lieu_naissance": normalized_row.get('lieu_naissance', 'Non renseigné'),
+                "profession": normalized_row.get('profession', ''),
+                "nationalite": normalized_row.get('nationalite', ''),
+                "situation_familiale": normalized_row.get('situation_familiale', ''),
+                
+                # Gestion campagne
+                "statut": normalized_row.get('statut', 'Prospect'),
+                "date_upload": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                "nb_appels": 0,
+                "dernier_appel": None,
+                "notes": ""
+            }
         
         upload_stats["total_clients"] = len(clients_database)
         upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
         # Affichage des statistiques de détection
         auto_detected = len([c for c in clients_database.values() if c['banque'] not in ['N/A', ''] and c['iban']])
-        print(f"🏦 Détection automatique: {auto_detected} banques détectées sur {len(clients_database)} clients")
+        logger.info(f"🏦 Détection automatique: {auto_detected} banques détectées sur {len(clients_database)} clients")
         
         return len(clients_database)
         
     except Exception as e:
-        print(f"Erreur lecture CSV: {str(e)}")
+        logger.error(f"Erreur lecture CSV: {str(e)}")
         raise ValueError(f"Erreur lecture CSV: {str(e)}")
 
 def get_client_info(phone_number):
     """Récupère les infos client depuis la base chargée"""
     # Normalisation du numéro entrant
-    normalized_number = phone_number.replace(' ', '').replace('.', '').replace('-', '').replace('(', '').replace(')', '')
-    if normalized_number.startswith('+33'):
-        normalized_number = '0' + normalized_number[3:]
-    elif normalized_number.startswith('33') and len(normalized_number) > 10:
-        normalized_number = '0' + normalized_number[2:]
+    normalized_number = normalize_phone(phone_number)
+    
+    if not normalized_number:
+        return create_unknown_client(phone_number)
     
     # Recherche exacte
     if normalized_number in clients_database:
@@ -271,6 +687,10 @@ def get_client_info(phone_number):
                 return client_copy
     
     # Client inconnu
+    return create_unknown_client(phone_number)
+
+def create_unknown_client(phone_number):
+    """Crée une fiche client pour un numéro inconnu"""
     return {
         "nom": "INCONNU",
         "prenom": "CLIENT",
@@ -296,128 +716,19 @@ def get_client_info(phone_number):
         "notes": ""
     }
 
-def send_telegram_message(message):
-    """Envoie un message vers Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {
-            'chat_id': CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        return response.json()
-    except Exception as e:
-        print(f"❌ Erreur Telegram: {str(e)}")
-        return None
-
-def format_client_message(client_info, context="appel"):
-    """Formate un message client pour Telegram"""
-    if context == "appel":
-        emoji_statut = "📞" if client_info['statut'] != "Non référencé" else "❓"
-        
-        # Emoji spécial pour banque détectée automatiquement
-        banque_display = client_info.get('banque', 'N/A')
-        if banque_display not in ['N/A', ''] and client_info.get('iban'):
-            if banque_display.startswith('🌐'):
-                banque_display = f"{banque_display} (API)"
-            elif banque_display.startswith('📍'):
-                banque_display = f"{banque_display} (local)"
-            else:
-                banque_display = f"🤖 {banque_display} (auto-détectée)"
-        
-        return f"""
-{emoji_statut} <b>APPEL ENTRANT</b>
-📞 Numéro: <code>{client_info['telephone']}</code>
-🕐 Heure: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
-
-👤 <b>IDENTITÉ</b>
-▪️ Nom: <b>{client_info['nom']}</b>
-▪️ Prénom: <b>{client_info['prenom']}</b>
-👥 Sexe: {client_info.get('sexe', 'N/A')}
-🎂 Date de naissance: {client_info.get('date_naissance', 'N/A')}
-📍 Lieu de naissance: {client_info.get('lieu_naissance', 'N/A')}
-
-🏢 <b>PROFESSIONNEL</b>
-▪️ Entreprise: {client_info['entreprise']}
-▪️ Profession: {client_info.get('profession', 'N/A')}
-▪️ Email: {client_info['email']}
-
-🏠 <b>COORDONNÉES</b>
-▪️ Adresse: {client_info['adresse']}
-▪️ Ville: {client_info['ville']} {client_info['code_postal']}
-
-🏦 <b>INFORMATIONS BANCAIRES</b>
-▪️ Banque: {banque_display}
-▪️ SWIFT: <code>{client_info.get('swift', 'N/A')}</code>
-▪️ IBAN: <code>{client_info.get('iban', 'N/A')}</code>
-
-📊 <b>CAMPAGNE</b>
-▪️ Statut: <b>{client_info['statut']}</b>
-▪️ Nb appels: {client_info['nb_appels']}
-▪️ Dernier appel: {client_info['dernier_appel'] or 'Premier appel'}
-        """
-    else:  # Recherche manuelle
-        # Emoji spécial pour banque détectée automatiquement
-        banque_display = client_info.get('banque', 'N/A')
-        if banque_display not in ['N/A', ''] and client_info.get('iban'):
-            if banque_display.startswith('🌐'):
-                banque_display = f"{banque_display} (API)"
-            elif banque_display.startswith('📍'):
-                banque_display = f"{banque_display} (local)"
-            else:
-                banque_display = f"🤖 {banque_display} (auto-détectée)"
-            
-        return f"""
-📋 <b>RÉSULTAT TROUVÉ :</b>
-
-👤 <b>IDENTITÉ</b>
-🙋 Nom : <b>{client_info['nom']}</b>
-👤 Prénom : <b>{client_info['prenom']}</b>
-👥 Sexe : {client_info.get('sexe', 'N/A')}
-🎂 Date de naissance : {client_info.get('date_naissance', 'N/A')}
-📍 Lieu de naissance : {client_info.get('lieu_naissance', 'N/A')}
-🌍 Nationalité : {client_info.get('nationalite', 'N/A')}
-
-🏢 <b>PROFESSIONNEL</b>
-▪️ Entreprise : {client_info['entreprise']}
-▪️ Profession : {client_info.get('profession', 'N/A')}
-📧 Email : {client_info['email']}
-📞 Téléphone : <code>{client_info['telephone']}</code>
-
-🏠 <b>ADRESSE</b>
-▪️ Adresse : {client_info['adresse']}
-📮 Code postal : {client_info['code_postal']}
-🏘️ Ville : {client_info['ville']}
-
-🏦 <b>INFORMATIONS BANCAIRES</b>
-🏛️ Banque : {banque_display}
-💳 SWIFT : <code>{client_info.get('swift', 'N/A')}</code>
-🏦 IBAN : <code>{client_info.get('iban', 'N/A')}</code>
-
-👨‍👩‍👧‍👦 <b>SITUATION</b>
-▪️ Situation familiale : {client_info.get('situation_familiale', 'N/A')}
-
-💼 <b>CAMPAGNE</b>
-▪️ Statut: <b>{client_info['statut']}</b>
-▪️ Ajouté le: {client_info.get('date_upload', 'N/A')}
-▪️ Nb appels: {client_info['nb_appels']}
-▪️ Dernier appel: {client_info['dernier_appel'] or 'Jamais appelé'}
-        """
-
 def process_telegram_command(message_text, chat_id):
     """Traite les commandes Telegram reçues"""
     try:
         if message_text.startswith('/numero '):
             phone_number = message_text.replace('/numero ', '').strip()
             client_info = get_client_info(phone_number)
-            response_message = format_client_message(client_info, context="recherche")
-            send_telegram_message(response_message)
+            response_message = telegram_service.format_client_message(client_info, context="recherche")
+            telegram_service.send_message(response_message)
             return {"status": "command_processed", "command": "numero", "phone": phone_number}
             
         elif message_text.startswith('/iban '):
             iban = message_text.replace('/iban ', '').strip()
-            detected_bank = detect_bank_with_cache(iban)
+            detected_bank = iban_detector.detect_bank(iban)
             response_message = f"""
 🏦 <b>ANALYSE IBAN VIA API</b>
 
@@ -426,7 +737,7 @@ def process_telegram_command(message_text, chat_id):
 
 🌐 <i>Détection via APIs externes avec fallback local</i>
             """
-            send_telegram_message(response_message)
+            telegram_service.send_message(response_message)
             return {"status": "iban_analyzed", "iban": iban, "bank": detected_bank}
             
         elif message_text.startswith('/stats'):
@@ -438,13 +749,13 @@ def process_telegram_command(message_text, chat_id):
 📁 Dernier upload: {upload_stats['last_upload'] or 'Aucun'}
 📋 Fichier: {upload_stats['filename'] or 'Aucun'}
 🏦 Banques auto-détectées: {auto_detected}
-🚀 CTI Keyyo: {'✅ Configuré' if keyyo_csi_token else '❌ Non configuré'}
+🚀 CTI Keyyo: {'✅ Configuré' if keyyo_client.csi_token else '❌ Non configuré'}
 
 📞 <b>APPELS DU JOUR</b>
 ▪️ Clients appelants: {len([c for c in clients_database.values() if c['dernier_appel'] and c['dernier_appel'].startswith(datetime.now().strftime('%d/%m/%Y'))])}
 ▪️ Nouveaux contacts: {len([c for c in clients_database.values() if c['nb_appels'] == 0])}
             """
-            send_telegram_message(stats_message)
+            telegram_service.send_message(stats_message)
             return {"status": "stats_sent"}
             
         elif message_text.startswith('/help'):
@@ -469,235 +780,19 @@ def process_telegram_command(message_text, chat_id):
 ▪️ Les notifications en temps réel
 ▪️ 🌐 Détection automatique des banques via APIs IBAN
             """
-            send_telegram_message(help_message)
+            telegram_service.send_message(help_message)
             return {"status": "help_sent"}
             
         else:
             return {"status": "unknown_command"}
             
     except Exception as e:
-        print(f"❌ Erreur commande Telegram: {str(e)}")
+        logger.error(f"❌ Erreur commande Telegram: {str(e)}")
         return {"error": str(e)}
 
-# =================== FONCTIONS OAUTH2 KEYYO CORRIGÉES ===================
-
-def get_keyyo_auth_url():
-    """Génère l'URL d'autorisation OAuth2 Keyyo"""
-    auth_params = {
-        'response_type': 'code',
-        'client_id': KEYYO_CLIENT_ID,
-        'redirect_uri': KEYYO_REDIRECT_URI,
-        'scope': 'cti_admin full_access_read_only',
-        'state': 'webhook_telegram_cti'
-    }
-    
-    return f"https://ssl.keyyo.com/oauth2/authorize.php?{urlencode(auth_params)}"
-
-def exchange_code_for_token(auth_code):
-    """Échange le code d'autorisation contre un access token - VERSION CORRIGÉE RFC 6749"""
-    global keyyo_access_token
-    
-    # Encoder correctement les credentials selon RFC 6749 Section 2.3.1
-    # Les credentials doivent être URL-encodés avant l'encoding Base64
-    client_id_encoded = quote_plus(KEYYO_CLIENT_ID)
-    client_secret_encoded = quote_plus(KEYYO_CLIENT_SECRET)
-    credentials_string = f"{client_id_encoded}:{client_secret_encoded}"
-    credentials = base64.b64encode(credentials_string.encode()).decode()
-    
-    # Headers selon RFC 6749 Section 3.2
-    headers = {
-        'Authorization': f'Basic {credentials}',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json'
-    }
-    
-    # Data selon RFC 6749 Section 4.1.3
-    data = {
-        'grant_type': 'authorization_code',
-        'code': auth_code,
-        'redirect_uri': KEYYO_REDIRECT_URI
-    }
-    
-    print(f"🔍 Debug OAuth2 CORRIGÉ:")
-    print(f"📋 URL: https://api.keyyo.com/oauth2/token.php")
-    print(f"📋 Method: POST")
-    print(f"📋 Headers: {headers}")
-    print(f"📋 Data: {data}")
-    print(f"📋 Client ID: {KEYYO_CLIENT_ID}")
-    print(f"📋 Redirect URI: {KEYYO_REDIRECT_URI}")
-    print(f"📋 Auth code: {auth_code[:20]}...")
-    
-    try:
-        # REQUÊTE POST selon RFC 6749
-        response = requests.post(
-            'https://api.keyyo.com/oauth2/token.php', 
-            headers=headers, 
-            data=data,
-            timeout=30
-        )
-        
-        print(f"🔍 Debug Response:")
-        print(f"📋 Status: {response.status_code}")
-        print(f"📋 Headers: {dict(response.headers)}")
-        print(f"📋 Content: {response.text}")
-        
-        if response.status_code == 200:
-            token_data = response.json()
-            keyyo_access_token = token_data['access_token']
-            print(f"✅ Access token Keyyo récupéré: {keyyo_access_token[:20]}...")
-            
-            # Afficher toutes les infos du token
-            print(f"🔍 Debug Token complet: {json.dumps(token_data, indent=2)}")
-            
-            return True
-        else:
-            print(f"❌ Erreur récupération token: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Erreur OAuth2: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def get_csi_token():
-    """Récupère le CSI token nécessaire pour CTI avec debug amélioré"""
-    global keyyo_csi_token
-    
-    if not keyyo_access_token:
-        print("❌ Pas d'access token disponible")
-        return None
-    
-    headers = {
-        'Authorization': f'Bearer {keyyo_access_token}',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        print("🔍 Debug: Tentative récupération des services...")
-        
-        # D'abord, récupérer la liste des services
-        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
-        
-        print(f"🔍 Debug: Status code services: {response.status_code}")
-        print(f"🔍 Debug: Response headers: {response.headers}")
-        print(f"🔍 Debug: Response text: {response.text}")
-        
-        if response.status_code == 200:
-            services = response.json()
-            print(f"📋 Services trouvés: {json.dumps(services, indent=2)}")
-            
-            # Analyser la structure de la réponse
-            if isinstance(services, dict):
-                if 'services' in services:
-                    # Structure: {"services": {"csi1": {...}, "csi2": {...}}}
-                    services_dict = services['services']
-                elif services:
-                    # Structure: {"csi1": {...}, "csi2": {...}}
-                    services_dict = services
-                else:
-                    print("❌ Structure services vide ou inconnue")
-                    return None
-            elif isinstance(services, list):
-                # Structure: [{"csi": "...", ...}, ...]
-                print("📋 Services en liste, recherche CSI...")
-                services_dict = {}
-                for service in services:
-                    if 'csi' in service:
-                        services_dict[service['csi']] = service
-                    elif 'id' in service:
-                        services_dict[service['id']] = service
-            else:
-                print(f"❌ Type de réponse inattendu: {type(services)}")
-                return None
-            
-            print(f"🔍 Debug: Services dict: {services_dict}")
-            
-            # Prendre le premier service (CSI)
-            if services_dict and len(services_dict) > 0:
-                csi = list(services_dict.keys())[0]  # Premier CSI disponible
-                print(f"🎯 CSI sélectionné: {csi}")
-                
-                # Essayer différentes URLs pour générer le CSI token
-                possible_urls = [
-                    f'https://api.keyyo.com/1.0/services/{csi}/csi_token',
-                    f'https://api.keyyo.com/services/{csi}/csi_token',
-                    f'https://api.keyyo.com/1.0/services/{csi}/token',
-                ]
-                
-                for url in possible_urls:
-                    print(f"🔍 Debug: Tentative URL: {url}")
-                    
-                    csi_response = requests.post(url, headers=headers)
-                    
-                    print(f"🔍 Debug: CSI Status: {csi_response.status_code}")
-                    print(f"🔍 Debug: CSI Response: {csi_response.text}")
-                    
-                    if csi_response.status_code == 200:
-                        try:
-                            csi_data = csi_response.json()
-                            print(f"🔍 Debug: CSI Data: {json.dumps(csi_data, indent=2)}")
-                            
-                            # Chercher le token dans différents champs possibles
-                            token_fields = ['csi_token', 'token', 'access_token', 'cti_token']
-                            
-                            for field in token_fields:
-                                if field in csi_data:
-                                    keyyo_csi_token = csi_data[field]
-                                    print(f"✅ CSI Token trouvé dans '{field}': {keyyo_csi_token[:20]}...")
-                                    return keyyo_csi_token
-                            
-                            print(f"❌ Aucun champ token trouvé dans: {list(csi_data.keys())}")
-                            
-                        except json.JSONDecodeError:
-                            print(f"❌ Réponse non-JSON: {csi_response.text}")
-                    else:
-                        print(f"❌ Erreur génération CSI token: {csi_response.status_code} - {csi_response.text}")
-                
-                print("❌ Aucune URL n'a fonctionné pour générer le CSI token")
-                return None
-                
-            else:
-                print("❌ Aucun service trouvé dans la réponse")
-                return None
-                
-        elif response.status_code == 401:
-            print("❌ Token d'accès invalide ou expiré")
-            return None
-        elif response.status_code == 403:
-            print("❌ Permissions insuffisantes - vérifiez les scopes OAuth2")
-            return None
-        else:
-            print(f"❌ Erreur récupération services: {response.status_code} - {response.text}")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Erreur récupération CSI: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
-    return None
-
-def test_keyyo_api():
-    """Test de l'API Keyyo avec le token actuel"""
-    if not keyyo_access_token:
-        return {"error": "Pas d'access token"}
-    
-    headers = {
-        'Authorization': f'Bearer {keyyo_access_token}',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
-        return {
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code == 200 else response.text
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# =================== ROUTES WEBHOOK ===================
+# ===================================================================
+# ROUTES WEBHOOK
+# ===================================================================
 
 @app.route('/webhook/ovh', methods=['POST', 'GET'])
 def ovh_webhook():
@@ -711,33 +806,24 @@ def ovh_webhook():
             event_type = request.args.get('type', 'unknown')
             call_status = f"CGI-{event_type}"
             
-            print(f"🔔 [{timestamp}] Appel CGI OVH:")
-            print(f"📞 Appelant: {caller_number}")
-            print(f"📞 Appelé: {called_number}")
-            print(f"📋 Type: {event_type}")
+            logger.info(f"🔔 [{timestamp}] Appel CGI OVH: {caller_number} -> {called_number} ({event_type})")
         else:
             data = request.get_json() or {}
             caller_number = data.get('callerIdNumber', request.args.get('caller', 'Inconnu'))
             call_status = data.get('status', 'incoming')
             
-            print(f"🔔 [{timestamp}] Appel JSON:")
-            print(f"📋 Données: {json.dumps(data, indent=2)}")
+            logger.info(f"🔔 [{timestamp}] Appel JSON: {json.dumps(data, indent=2)}")
         
         # Récupération fiche client
         client_info = get_client_info(caller_number)
         
         # Message Telegram formaté
-        telegram_message = format_client_message(client_info, context="appel")
+        telegram_message = telegram_service.format_client_message(client_info, context="appel")
         telegram_message += f"\n📊 Statut appel: {call_status}"
         telegram_message += f"\n🔗 Source: {'OVH' if 'CGI' in call_status else 'Keyyo CTI'}"
         
         # Envoi vers Telegram
-        telegram_result = send_telegram_message(telegram_message)
-        
-        if telegram_result:
-            print("✅ Message Telegram envoyé")
-        else:
-            print("❌ Échec envoi Telegram")
+        telegram_result = telegram_service.send_message(telegram_message)
         
         return jsonify({
             "status": "success",
@@ -752,7 +838,7 @@ def ovh_webhook():
         })
         
     except Exception as e:
-        print(f"❌ Erreur webhook: {str(e)}")
+        logger.error(f"❌ Erreur webhook: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/telegram', methods=['POST'])
@@ -766,7 +852,7 @@ def telegram_webhook():
             chat_id = data['message']['chat']['id']
             user_name = data['message']['from'].get('first_name', 'Utilisateur')
             
-            print(f"📱 Commande reçue de {user_name}: {message_text}")
+            logger.info(f"📱 Commande reçue de {user_name}: {message_text}")
             
             result = process_telegram_command(message_text, chat_id)
             
@@ -779,15 +865,17 @@ def telegram_webhook():
         return jsonify({"status": "no_text_message"})
         
     except Exception as e:
-        print(f"❌ Erreur webhook Telegram: {str(e)}")
+        logger.error(f"❌ Erreur webhook Telegram: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# =================== ROUTES OAUTH2 KEYYO ===================
+# ===================================================================
+# ROUTES OAUTH2 KEYYO
+# ===================================================================
 
 @app.route('/keyyo-auth')
 def keyyo_auth():
     """Démarre le processus d'authentification OAuth2"""
-    auth_url = get_keyyo_auth_url()
+    auth_url = keyyo_client.get_auth_url()
     return redirect(auth_url)
 
 @app.route('/oauth/keyyo/callback')
@@ -800,10 +888,10 @@ def keyyo_callback():
         return f"❌ Erreur OAuth2: {error}", 400
     
     if auth_code:
-        success = exchange_code_for_token(auth_code)
+        success = keyyo_client.exchange_code_for_token(auth_code)
         
         if success:
-            csi_token = get_csi_token()
+            csi_token = keyyo_client.generate_csi_token()
             
             if csi_token:
                 return f"""
@@ -870,8 +958,8 @@ def keyyo_manual_callback():
         </body>
         </html>
         """.format(
-            client_id=KEYYO_CLIENT_ID,
-            redirect_uri=KEYYO_REDIRECT_URI
+            client_id=Config.KEYYO_CLIENT_ID,
+            redirect_uri=Config.KEYYO_REDIRECT_URI
         )
     
     elif request.method == 'POST':
@@ -886,16 +974,16 @@ def keyyo_manual_callback():
                 auth_code = params['code'][0]
         
         if auth_code:
-            print(f"🔧 Test manuel OAuth2 avec code: {auth_code[:20]}...")
-            success = exchange_code_for_token(auth_code)
+            logger.info(f"🔧 Test manuel OAuth2 avec code: {auth_code[:20]}...")
+            success = keyyo_client.exchange_code_for_token(auth_code)
             
             if success:
-                csi_token = get_csi_token()
+                csi_token = keyyo_client.generate_csi_token()
                 
                 if csi_token:
                     return f"""
                     <h2>✅ Succès OAuth2 Manuel !</h2>
-                    <p><strong>Access Token:</strong> <code>{keyyo_access_token[:20]}...</code></p>
+                    <p><strong>Access Token:</strong> <code>{keyyo_client.access_token[:20]}...</code></p>
                     <p><strong>CSI Token:</strong> <code>{csi_token}</code></p>
                     <a href="/keyyo-cti" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🚀 Interface CTI</a>
                     <a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-left: 10px;">🏠 Accueil</a>
@@ -903,7 +991,7 @@ def keyyo_manual_callback():
                 else:
                     return f"""
                     <h2>⚠️ Access Token OK, mais erreur CSI Token</h2>
-                    <p><strong>Access Token:</strong> <code>{keyyo_access_token[:20]}...</code></p>
+                    <p><strong>Access Token:</strong> <code>{keyyo_client.access_token[:20]}...</code></p>
                     <p>Vérifiez les logs pour voir l'erreur CSI Token</p>
                     <a href="/debug-keyyo">🔍 Debug API</a>
                     """
@@ -919,158 +1007,19 @@ def keyyo_manual_callback():
             <a href="/oauth/keyyo/manual">🔄 Retour</a>
             """
 
-@app.route('/test-oauth-direct')
-def test_oauth_direct():
-    """Test OAuth2 avec paramètres hardcodés pour debug"""
-    
-    # Pour tester avec un code que vous récupérez manuellement
-    test_code = request.args.get('code', '')
-    
-    if test_code:
-        print(f"🧪 Test OAuth2 direct avec code: {test_code[:20]}...")
-        success = exchange_code_for_token(test_code)
-        
-        return jsonify({
-            "test": "oauth_direct",
-            "code_received": test_code[:20] + "...",
-            "exchange_success": success,
-            "access_token_available": keyyo_access_token is not None
-        })
-    else:
-        return jsonify({
-            "error": "Ajoutez ?code=VOTRE_CODE à l'URL pour tester"
-        })
-
-@app.route('/keyyo-cti')
-def keyyo_cti_interface():
-    """Interface CTI Keyyo"""
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>🚀 Interface CTI Keyyo</title>
-        <meta charset="UTF-8">
-        <style>
-            body { font-family: Arial; margin: 20px; background: #f5f5f5; }
-            .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }
-            .success { background: #e8f5e8; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #4CAF50; }
-            .btn { background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px; display: inline-block; }
-            .btn.success { background: #4CAF50; }
-            code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🚀 Interface CTI Keyyo</h1>
-            <p>Votre CSI Token: <strong><code>{{ csi_token }}</code></strong></p>
-            
-            <div class="success">
-                <h3>✅ Prochaines étapes:</h3>
-                <ol>
-                    <li>Copiez le CSI token ci-dessus</li>
-                    <li>Ouvrez l'interface CTI dans un nouvel onglet</li>
-                    <li>Collez le token et connectez-vous</li>
-                    <li>Les appels seront automatiquement envoyés à Telegram!</li>
-                </ol>
-            </div>
-            
-            <a href="https://keyyo-cti-interface.up.railway.app" target="_blank" class="btn success">🚀 Ouvrir Interface CTI</a>
-            <a href="/keyyo-status" class="btn">📊 Status Keyyo</a>
-            <a href="/" class="btn">🏠 Retour accueil</a>
-        </div>
-    </body>
-    </html>
-    """, csi_token=keyyo_csi_token or 'Non disponible')
-
-@app.route('/keyyo-status')
-def keyyo_status():
-    """Status de l'intégration Keyyo"""
-    return jsonify({
-        "access_token_available": keyyo_access_token is not None,
-        "csi_token_available": keyyo_csi_token is not None,
-        "csi_token_preview": keyyo_csi_token[:20] + "..." if keyyo_csi_token else None,
-        "auth_url": get_keyyo_auth_url(),
-        "client_id": KEYYO_CLIENT_ID,
-        "redirect_uri": KEYYO_REDIRECT_URI
-    })
-
-@app.route('/debug-keyyo')
-def debug_keyyo():
-    """Debug manuel de l'API Keyyo"""
-    if not keyyo_access_token:
-        return jsonify({"error": "Pas d'access token. Faites d'abord /keyyo-auth"})
-    
-    headers = {
-        'Authorization': f'Bearer {keyyo_access_token}',
-        'Content-Type': 'application/json'
-    }
-    
-    debug_info = {
-        "access_token_preview": keyyo_access_token[:20] + "..." if keyyo_access_token else None,
-        "tests": []
-    }
-    
-    # Test 1: Services
-    try:
-        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
-        debug_info["tests"].append({
-            "endpoint": "/1.0/services",
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code == 200 else response.text,
-            "headers": dict(response.headers)
-        })
-    except Exception as e:
-        debug_info["tests"].append({
-            "endpoint": "/1.0/services",
-            "error": str(e)
-        })
-    
-    # Test 2: Alternative services endpoint
-    try:
-        response = requests.get('https://api.keyyo.com/services', headers=headers)
-        debug_info["tests"].append({
-            "endpoint": "/services",
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code == 200 else response.text,
-            "headers": dict(response.headers)
-        })
-    except Exception as e:
-        debug_info["tests"].append({
-            "endpoint": "/services",
-            "error": str(e)
-        })
-    
-    # Test 3: User info
-    try:
-        response = requests.get('https://api.keyyo.com/1.0/user', headers=headers)
-        debug_info["tests"].append({
-            "endpoint": "/1.0/user",
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code == 200 else response.text
-        })
-    except Exception as e:
-        debug_info["tests"].append({
-            "endpoint": "/1.0/user",
-            "error": str(e)
-        })
-    
-    return jsonify(debug_info)
-
 @app.route('/manual-csi', methods=['GET', 'POST'])
 def manual_csi():
     """Interface pour saisie manuelle du CSI token"""
-    global keyyo_csi_token
-    
     if request.method == 'POST':
         manual_token = request.form.get('csi_token', '').strip()
         
         if manual_token:
-            keyyo_csi_token = manual_token
-            print(f"✅ CSI Token saisi manuellement: {keyyo_csi_token[:20]}...")
+            keyyo_client.csi_token = manual_token
+            logger.info(f"✅ CSI Token saisi manuellement: {keyyo_client.csi_token[:20]}...")
             
             return f"""
             <h2>✅ CSI Token configuré manuellement !</h2>
-            <p><strong>Token:</strong> <code>{keyyo_csi_token[:20]}...</code></p>
+            <p><strong>Token:</strong> <code>{keyyo_client.csi_token[:20]}...</code></p>
             <a href="/keyyo-cti" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🚀 Ouvrir Interface CTI</a>
             <a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-left: 10px;">🏠 Retour accueil</a>
             """
@@ -1116,15 +1065,89 @@ def manual_csi():
     </html>
     """
 
-# =================== ROUTES PRINCIPALES ===================
+@app.route('/keyyo-cti')
+def keyyo_cti_interface():
+    """Interface CTI Keyyo"""
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🚀 Interface CTI Keyyo</title>
+        <meta charset="UTF-8">
+        <style>
+            body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }
+            .success { background: #e8f5e8; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #4CAF50; }
+            .btn { background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px; display: inline-block; }
+            .btn.success { background: #4CAF50; }
+            code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 Interface CTI Keyyo</h1>
+            <p>Votre CSI Token: <strong><code>{{ csi_token }}</code></strong></p>
+            
+            <div class="success">
+                <h3>✅ Prochaines étapes:</h3>
+                <ol>
+                    <li>Copiez le CSI token ci-dessus</li>
+                    <li>Ouvrez l'interface CTI dans un nouvel onglet</li>
+                    <li>Collez le token et connectez-vous</li>
+                    <li>Les appels seront automatiquement envoyés à Telegram!</li>
+                </ol>
+            </div>
+            
+            <a href="https://keyyo-cti-interface.up.railway.app" target="_blank" class="btn success">🚀 Ouvrir Interface CTI</a>
+            <a href="/keyyo-status" class="btn">📊 Status Keyyo</a>
+            <a href="/" class="btn">🏠 Retour accueil</a>
+        </div>
+    </body>
+    </html>
+    """, csi_token=keyyo_client.csi_token or 'Non disponible')
+
+@app.route('/keyyo-status')
+def keyyo_status():
+    """Status de l'intégration Keyyo"""
+    return jsonify({
+        "access_token_available": keyyo_client.access_token is not None,
+        "csi_token_available": keyyo_client.csi_token is not None,
+        "csi_token_preview": keyyo_client.csi_token[:20] + "..." if keyyo_client.csi_token else None,
+        "auth_url": keyyo_client.get_auth_url(),
+        "client_id": Config.KEYYO_CLIENT_ID,
+        "redirect_uri": Config.KEYYO_REDIRECT_URI
+    })
+
+@app.route('/debug-keyyo')
+def debug_keyyo():
+    """Debug manuel de l'API Keyyo"""
+    if not keyyo_client.access_token:
+        return jsonify({"error": "Pas d'access token. Faites d'abord /keyyo-auth"})
+    
+    test_result = keyyo_client.test_api()
+    
+    debug_info = {
+        "access_token_preview": keyyo_client.access_token[:20] + "..." if keyyo_client.access_token else None,
+        "csi_token_available": keyyo_client.csi_token is not None,
+        "api_test": test_result
+    }
+    
+    return jsonify(debug_info)
+
+# ===================================================================
+# ROUTES PRINCIPALES
+# ===================================================================
 
 @app.route('/')
 def home():
+    """Page d'accueil avec dashboard"""
+    auto_detected = len([c for c in clients_database.values() if c['banque'] not in ['N/A', ''] and c['iban']])
+    
     return render_template_string("""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🤖 Webhook OVH-Telegram - Gestion Clients</title>
+    <title>🤖 Webhook OVH-Telegram - Version Corrigée</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
@@ -1147,16 +1170,17 @@ def home():
         .info-box { background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 10px 0; }
         .new-feature { background: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 10px 0; }
         .keyyo-section { background: #e1f5fe; border-left: 4px solid #4CAF50; padding: 15px; margin: 20px 0; }
+        .fixed-version { background: #e8f5e8; border-left: 4px solid #4CAF50; padding: 15px; margin: 10px 0; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 Webhook OVH-Telegram + 🚀 CTI Keyyo</h1>
-            <p class="success">✅ Serveur Railway actif 24/7 - Bot configuré</p>
-            <div class="new-feature">
-                <strong>🆕 NOUVELLE FONCTIONNALITÉ :</strong> 🚀 Intégration CTI Keyyo temps réel + 🌐 Détection automatique banques IBAN !
+            <div class="fixed-version">
+                <strong>✅ VERSION CORRIGÉE :</strong> Architecture modulaire, fonction get_csi_token() corrigée, optimisations de performance !
             </div>
+            <p class="success">✅ Serveur Railway actif 24/7 - Bot configuré</p>
         </div>
 
         <div class="stats">
@@ -1165,12 +1189,12 @@ def home():
                 <h2>{{ total_clients }}</h2>
             </div>
             <div class="stat-card">
-                <h3>📁 Dernier upload</h3>
-                <p>{{ last_upload or 'Aucun' }}</p>
+                <h3>🏦 Banques détectées</h3>
+                <h2>{{ auto_detected }}</h2>
             </div>
             <div class="stat-card">
-                <h3>📋 Fichier actuel</h3>
-                <p>{{ filename or 'Aucun' }}</p>
+                <h3>📁 Dernier upload</h3>
+                <p>{{ last_upload or 'Aucun' }}</p>
             </div>
             <div class="stat-card">
                 <h3>🚀 CTI Keyyo</h3>
@@ -1188,7 +1212,6 @@ def home():
                     <li>🔑 <strong>Saisie manuelle</strong> : <a href="/manual-csi" style="color: #ff9800; font-weight: bold;">CSI Token Manuel</a></li>
                     <li>📊 <strong>Vérifiez le statut</strong> : <a href="/keyyo-status" style="color: #2196F3;">Status intégration</a></li>
                     <li>🚀 <strong>Interface CTI</strong> : <a href="/keyyo-cti" style="color: #ff9800;">Ouvrir supervision</a></li>
-                    <li>✅ <strong>Test complet</strong> : Appelez votre numéro et vérifiez Telegram</li>
                 </ol>
             </div>
             
@@ -1246,7 +1269,7 @@ def home():
         <h2>📱 Commandes Telegram disponibles</h2>
         <ul>
             <li><code>/numero 0123456789</code> - Affiche fiche client complète</li>
-            <li><code>/iban FR76XXXXXXXXX</code> - <span class="new-feature" style="display: inline; background: #fff3e0; padding: 2px 6px;">🆕 Détecte la banque depuis l'IBAN</span></li>
+            <li><code>/iban FR76XXXXXXXXX</code> - Détecte la banque depuis l'IBAN</li>
             <li><code>/stats</code> - Statistiques de la campagne + status CTI Keyyo</li>
             <li><code>/help</code> - Aide et liste des commandes</li>
         </ul>
@@ -1263,14 +1286,27 @@ def home():
                 <li>🆕 Utilisez <code>/iban FR76XXXXX</code> pour tester la détection de banque</li>
             </ol>
         </div>
+        
+        <div class="fixed-version">
+            <h3>🔧 Améliorations de cette version :</h3>
+            <ul>
+                <li>✅ Fonction <code>get_csi_token()</code> corrigée selon la documentation Keyyo</li>
+                <li>✅ Architecture modulaire avec services séparés</li>
+                <li>✅ Cache amélioré pour les détections IBAN</li>
+                <li>✅ Rate limiting pour éviter le spam</li>
+                <li>✅ Logging structuré et gestion d'erreurs améliorée</li>
+                <li>✅ Normalisation avancée des numéros de téléphone</li>
+                <li>✅ Optimisations de performance</li>
+            </ul>
+        </div>
     </div>
 </body>
 </html>
     """, 
     total_clients=upload_stats["total_clients"],
+    auto_detected=auto_detected,
     last_upload=upload_stats["last_upload"],
-    filename=upload_stats["filename"],
-    csi_available=keyyo_csi_token is not None
+    csi_available=keyyo_client.csi_token is not None
     )
 
 @app.route('/upload', methods=['POST'])
@@ -1296,7 +1332,7 @@ def upload_file():
             auto_detected = len([c for c in clients_database.values() if c['banque'] not in ['N/A', ''] and c['iban']])
             
         else:
-            return jsonify({"error": "Seuls les fichiers CSV sont supportés dans cette version"}), 400
+            return jsonify({"error": "Seuls les fichiers CSV sont supportés"}), 400
         
         return jsonify({
             "status": "success",
@@ -1307,6 +1343,7 @@ def upload_file():
         })
         
     except Exception as e:
+        logger.error(f"Erreur upload: {str(e)}")
         return jsonify({"error": f"Erreur upload: {str(e)}"}), 500
 
 @app.route('/clients')
@@ -1321,6 +1358,8 @@ def view_clients():
     else:
         # Limite à 100 pour la performance
         filtered_clients = dict(list(clients_database.items())[:100])
+    
+    auto_detected = len([c for c in clients_database.values() if c['banque'] not in ['N/A', ''] and c['iban']])
     
     return render_template_string("""
 <!DOCTYPE html>
@@ -1435,7 +1474,7 @@ def view_clients():
     displayed_count=len(filtered_clients),
     with_calls=len([c for c in clients_database.values() if c['nb_appels'] > 0]),
     today_calls=len([c for c in clients_database.values() if c['dernier_appel'] and c['dernier_appel'].startswith(datetime.now().strftime('%d/%m/%Y'))]),
-    auto_detected=len([c for c in clients_database.values() if c['banque'] not in ['N/A', ''] and c['iban']]),
+    auto_detected=auto_detected,
     search=search
     )
 
@@ -1445,6 +1484,7 @@ def clear_clients():
     global clients_database, upload_stats
     clients_database = {}
     upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
+    cache.clear()  # Vider aussi le cache
     return redirect('/')
 
 @app.route('/setup-telegram-webhook')
@@ -1452,7 +1492,7 @@ def setup_telegram_webhook():
     """Configure le webhook Telegram pour recevoir les commandes"""
     try:
         webhook_url = f"https://web-production-95ca.up.railway.app/webhook/telegram"
-        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        telegram_api_url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/setWebhook"
         
         data = {"url": webhook_url}
         response = requests.post(telegram_api_url, data=data)
@@ -1468,8 +1508,8 @@ def setup_telegram_webhook():
 @app.route('/test-telegram')
 def test_telegram():
     """Test d'envoi Telegram"""
-    message = f"🧪 Test de connexion - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-    result = send_telegram_message(message)
+    message = f"🧪 Test de connexion - Version corrigée - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    result = telegram_service.send_message(message)
     
     if result:
         return jsonify({"status": "success", "message": "Test Telegram envoyé avec succès"})
@@ -1485,7 +1525,7 @@ def test_command():
     else:
         test_number = "0767328146"  # Numéro par défaut
     
-    result = process_telegram_command(f"/numero {test_number}", CHAT_ID)
+    result = process_telegram_command(f"/numero {test_number}", Config.CHAT_ID)
     return jsonify({"test_result": result, "test_number": test_number})
 
 @app.route('/test-iban')
@@ -1502,14 +1542,14 @@ def test_iban():
     
     results = []
     for iban in test_ibans:
-        bank = detect_bank_with_cache(iban)
+        bank = iban_detector.detect_bank(iban)
         results.append({"iban": iban, "bank_detected": bank})
     
     return jsonify({
         "test_results": results,
-        "function_status": "API-enabled with fallback",
+        "function_status": "API-enabled with cache and fallback",
         "total_tests": len(test_ibans),
-        "cache_size": len(getattr(detect_bank_with_cache, 'cache', {}))
+        "cache_size": len(cache.cache)
     })
 
 @app.route('/test-ovh-cgi')
@@ -1537,18 +1577,22 @@ def test_ovh_cgi():
 
 @app.route('/health')
 def health():
+    """Status de l'application"""
     return jsonify({
         "status": "healthy", 
+        "version": "corrected",
         "service": "webhook-ovh-telegram-keyyo",
-        "telegram_configured": bool(TELEGRAM_TOKEN and CHAT_ID),
+        "telegram_configured": bool(Config.TELEGRAM_TOKEN and Config.CHAT_ID),
         "clients_loaded": upload_stats["total_clients"],
-        "iban_detection": "API-enabled with fallback",
-        "keyyo_oauth_configured": bool(KEYYO_CLIENT_ID and KEYYO_CLIENT_SECRET),
-        "keyyo_authenticated": keyyo_access_token is not None,
-        "keyyo_cti_ready": keyyo_csi_token is not None,
+        "iban_detection": "API-enabled with cache and fallback",
+        "keyyo_oauth_configured": bool(Config.KEYYO_CLIENT_ID and Config.KEYYO_CLIENT_SECRET),
+        "keyyo_authenticated": keyyo_client.access_token is not None,
+        "keyyo_cti_ready": keyyo_client.csi_token is not None,
+        "cache_size": len(cache.cache),
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    logger.info(f"🚀 Démarrage de l'application sur le port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
