@@ -1591,8 +1591,294 @@ def health():
         "cache_size": len(cache.cache),
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
+# Ajoutez ces routes à la fin de votre app.py pour tester immédiatement
 
+@app.route('/test-oauth-direct')
+def test_oauth_direct():
+    """Test OAuth2 avec le code que vous avez reçu"""
+    # Utilisez le code de votre URL
+    test_code = "e457e407714dad048a8d54ef11319d377a18bf4c"
+    
+    logger.info(f"🧪 Test OAuth2 avec code: {test_code}")
+    
+    # Réinitialiser les tokens
+    keyyo_client.access_token = None
+    keyyo_client.csi_token = None
+    
+    # Tester l'échange
+    success = keyyo_client.exchange_code_for_token(test_code)
+    
+    result = {
+        "code_used": test_code,
+        "exchange_success": success,
+        "access_token_available": keyyo_client.access_token is not None
+    }
+    
+    if success:
+        # Tester la génération CSI avec la nouvelle fonction
+        logger.info("🚀 Test génération CSI avec fonction corrigée...")
+        csi_token = keyyo_client.generate_csi_token()
+        result.update({
+            "csi_generation_success": csi_token is not None,
+            "csi_token_preview": csi_token[:20] + "..." if csi_token else None,
+            "full_csi_token": csi_token  # Pour debug
+        })
+    
+    return jsonify(result)
+
+@app.route('/test-csi-multiple')
+def test_csi_multiple():
+    """Test génération CSI avec multiples approches"""
+    if not keyyo_client.access_token:
+        return jsonify({"error": "Pas d'access token. Allez d'abord sur /test-oauth-direct"})
+    
+    logger.info("🧪 Test CSI avec multiples configurations...")
+    
+    # Récupérer les services
+    services = keyyo_client.get_services()
+    if not services:
+        return jsonify({"error": "Impossible de récupérer les services"})
+    
+    services_dict = services.get('services', services) if isinstance(services, dict) else {}
+    if not services_dict:
+        return jsonify({"error": "Aucun service trouvé", "services_response": services})
+    
+    csi_id = list(services_dict.keys())[0]
+    
+    headers = {
+        'Authorization': f'Bearer {keyyo_client.access_token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+    
+    # Tester différentes configurations
+    test_results = []
+    
+    configs = [
+        {
+            'name': 'URL corrigée avec domain_masks',
+            'url': f'https://api.keyyo.com/manager/1.0/services/{csi_id}/csi_token',
+            'payload': {'domain_masks': ['*.up.railway.app', 'web-production-95ca.up.railway.app']}
+        },
+        {
+            'name': 'URL corrigée sans payload',
+            'url': f'https://api.keyyo.com/manager/1.0/services/{csi_id}/csi_token',
+            'payload': None
+        },
+        {
+            'name': 'Ancienne URL avec domain_masks',
+            'url': f'https://api.keyyo.com/1.0/services/{csi_id}/csi_token',
+            'payload': {'domain_masks': ['*.up.railway.app']}
+        },
+        {
+            'name': 'Ancienne URL sans payload',
+            'url': f'https://api.keyyo.com/1.0/services/{csi_id}/csi_token',
+            'payload': None
+        }
+    ]
+    
+    for config in configs:
+        try:
+            if config['payload']:
+                response = requests.post(
+                    config['url'],
+                    headers=headers,
+                    json=config['payload'],
+                    timeout=5
+                )
+            else:
+                response = requests.post(
+                    config['url'],
+                    headers=headers,
+                    timeout=5
+                )
+            
+            result = {
+                'name': config['name'],
+                'url': config['url'],
+                'payload': config['payload'],
+                'status_code': response.status_code,
+                'response': response.text,
+                'success': response.status_code == 200
+            }
+            
+            if response.status_code == 200:
+                try:
+                    json_data = response.json()
+                    result['json_response'] = json_data
+                    # Chercher le token
+                    for field in ['csi_token', 'token', 'access_token']:
+                        if field in json_data and json_data[field]:
+                            result['token_found'] = json_data[field]
+                            break
+                except:
+                    result['raw_response'] = response.text
+            
+            test_results.append(result)
+            
+        except Exception as e:
+            test_results.append({
+                'name': config['name'],
+                'url': config['url'],
+                'error': str(e)
+            })
+    
+    return jsonify({
+        "csi_id": csi_id,
+        "services_found": list(services_dict.keys()),
+        "test_results": test_results
+    })
+
+@app.route('/manual-test-csi', methods=['GET', 'POST'])
+def manual_test_csi():
+    """Interface manuelle pour tester CSI"""
+    if request.method == 'GET':
+        return """
+        <html>
+        <head><title>🧪 Test CSI Manuel</title></head>
+        <body style="font-family: Arial; margin: 20px;">
+            <h1>🧪 Test CSI Token Manuel</h1>
+            
+            <h3>🔍 Étapes de diagnostic :</h3>
+            <ol>
+                <li><a href="/test-oauth-direct" target="_blank">1. Tester OAuth2 avec votre code</a></li>
+                <li><a href="/test-csi-multiple" target="_blank">2. Tester génération CSI (multiple configs)</a></li>
+                <li><a href="/debug-keyyo" target="_blank">3. Debug API Keyyo</a></li>
+            </ol>
+            
+            <h3>📋 URLs à tester manuellement :</h3>
+            <form method="POST">
+                <label><strong>URL CSI :</strong></label><br>
+                <input type="text" name="csi_url" style="width: 500px; padding: 5px;" 
+                       value="https://api.keyyo.com/manager/1.0/services/CSI_ID/csi_token"><br><br>
+                
+                <label><strong>Payload JSON (optionnel) :</strong></label><br>
+                <textarea name="payload" rows="3" style="width: 500px;">{"domain_masks": ["*.up.railway.app"]}</textarea><br><br>
+                
+                <button type="submit" style="background: #4CAF50; color: white; padding: 10px 20px; border: none;">🚀 Tester</button>
+            </form>
+            
+            <p><a href="/">🏠 Retour accueil</a></p>
+        </body>
+        </html>
+        """
+    
+    elif request.method == 'POST':
+        if not keyyo_client.access_token:
+            return jsonify({"error": "Pas d'access token"})
+        
+        csi_url = request.form.get('csi_url', '')
+        payload_str = request.form.get('payload', '')
+        
+        headers = {
+            'Authorization': f'Bearer {keyyo_client.access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            if payload_str.strip():
+                payload = json.loads(payload_str)
+                response = requests.post(csi_url, headers=headers, json=payload, timeout=5)
+            else:
+                response = requests.post(csi_url, headers=headers, timeout=5)
+            
+            return jsonify({
+                "url": csi_url,
+                "payload": payload_str,
+                "status_code": response.status_code,
+                "response": response.text,
+                "headers": dict(response.headers)
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)})
+
+# Correction rapide de la méthode dans KeyyoClient
+def quick_fix_csi_method():
+    """Applique le fix rapide à la méthode generate_csi_token"""
+    
+    def generate_csi_token_fixed(self):
+        """Version corrigée avec URL /manager/ et domain_masks"""
+        if not self.access_token:
+            logger.error("❌ Pas d'access token disponible")
+            return None
+        
+        services_data = self.get_services()
+        if not services_data:
+            return None
+        
+        services_dict = services_data.get('services', services_data) if isinstance(services_data, dict) else {}
+        if not services_dict:
+            return None
+        
+        csi_id = list(services_dict.keys())[0]
+        logger.info(f"🎯 CSI sélectionné: {csi_id}")
+        
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        # URL CORRIGÉE avec /manager/
+        csi_token_url = f'https://api.keyyo.com/manager/1.0/services/{csi_id}/csi_token'
+        logger.info(f"🚀 URL CORRIGÉE: {csi_token_url}")
+        
+        # Tenter avec domain_masks d'abord
+        payload = {'domain_masks': ['*.up.railway.app', 'web-production-95ca.up.railway.app']}
+        
+        try:
+            response = requests.post(csi_token_url, headers=headers, json=payload, timeout=10)
+            logger.info(f"📊 Status avec payload: {response.status_code}")
+            logger.info(f"📊 Response avec payload: {response.text}")
+            
+            if response.status_code == 200:
+                try:
+                    csi_data = response.json()
+                    for field in ['csi_token', 'token', 'access_token']:
+                        if field in csi_data and csi_data[field]:
+                            self.csi_token = csi_data[field]
+                            logger.info(f"✅ CSI Token trouvé: {self.csi_token[:20]}...")
+                            return self.csi_token
+                except:
+                    if len(response.text.strip()) > 10:
+                        self.csi_token = response.text.strip()
+                        return self.csi_token
+            
+            # Si échec avec payload, tenter sans
+            logger.info("🔄 Tentative sans payload...")
+            response2 = requests.post(csi_token_url, headers=headers, timeout=10)
+            logger.info(f"📊 Status sans payload: {response2.status_code}")
+            logger.info(f"📊 Response sans payload: {response2.text}")
+            
+            if response2.status_code == 200:
+                try:
+                    csi_data = response2.json()
+                    for field in ['csi_token', 'token', 'access_token']:
+                        if field in csi_data and csi_data[field]:
+                            self.csi_token = csi_data[field]
+                            return self.csi_token
+                except:
+                    if len(response2.text.strip()) > 10:
+                        self.csi_token = response2.text.strip()
+                        return self.csi_token
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur: {str(e)}")
+            return None
+    
+    # Remplacer la méthode
+    KeyyoClient.generate_csi_token = generate_csi_token_fixed
+    logger.info("✅ Méthode generate_csi_token corrigée automatiquement")
+
+# Appliquer le fix au démarrage
+quick_fix_csi_method()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Démarrage de l'application sur le port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
+
