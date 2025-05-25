@@ -7,7 +7,7 @@ import io
 import base64
 from datetime import datetime
 from werkzeug.utils import secure_filename
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus, urlparse, parse_qs
 
 app = Flask(__name__)
 app.secret_key = 'webhook-ovh-secret-key'
@@ -479,7 +479,7 @@ def process_telegram_command(message_text, chat_id):
         print(f"❌ Erreur commande Telegram: {str(e)}")
         return {"error": str(e)}
 
-# =================== FONCTIONS OAUTH2 KEYYO ===================
+# =================== FONCTIONS OAUTH2 KEYYO CORRIGÉES ===================
 
 def get_keyyo_auth_url():
     """Génère l'URL d'autorisation OAuth2 Keyyo"""
@@ -494,30 +494,61 @@ def get_keyyo_auth_url():
     return f"https://ssl.keyyo.com/oauth2/authorize.php?{urlencode(auth_params)}"
 
 def exchange_code_for_token(auth_code):
-    """Échange le code d'autorisation contre un access token"""
+    """Échange le code d'autorisation contre un access token - VERSION CORRIGÉE RFC 6749"""
     global keyyo_access_token
     
-    # Préparer les credentials
-    credentials = base64.b64encode(f"{KEYYO_CLIENT_ID}:{KEYYO_CLIENT_SECRET}".encode()).decode()
+    # Encoder correctement les credentials selon RFC 6749 Section 2.3.1
+    # Les credentials doivent être URL-encodés avant l'encoding Base64
+    client_id_encoded = quote_plus(KEYYO_CLIENT_ID)
+    client_secret_encoded = quote_plus(KEYYO_CLIENT_SECRET)
+    credentials_string = f"{client_id_encoded}:{client_secret_encoded}"
+    credentials = base64.b64encode(credentials_string.encode()).decode()
     
+    # Headers selon RFC 6749 Section 3.2
     headers = {
         'Authorization': f'Basic {credentials}',
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json'
     }
     
+    # Data selon RFC 6749 Section 4.1.3
     data = {
         'grant_type': 'authorization_code',
         'code': auth_code,
         'redirect_uri': KEYYO_REDIRECT_URI
     }
     
+    print(f"🔍 Debug OAuth2 CORRIGÉ:")
+    print(f"📋 URL: https://api.keyyo.com/oauth2/token.php")
+    print(f"📋 Method: POST")
+    print(f"📋 Headers: {headers}")
+    print(f"📋 Data: {data}")
+    print(f"📋 Client ID: {KEYYO_CLIENT_ID}")
+    print(f"📋 Redirect URI: {KEYYO_REDIRECT_URI}")
+    print(f"📋 Auth code: {auth_code[:20]}...")
+    
     try:
-        response = requests.post('https://api.keyyo.com/oauth2/token.php', headers=headers, data=data)
+        # REQUÊTE POST selon RFC 6749
+        response = requests.post(
+            'https://api.keyyo.com/oauth2/token.php', 
+            headers=headers, 
+            data=data,
+            timeout=30
+        )
+        
+        print(f"🔍 Debug Response:")
+        print(f"📋 Status: {response.status_code}")
+        print(f"📋 Headers: {dict(response.headers)}")
+        print(f"📋 Content: {response.text}")
         
         if response.status_code == 200:
             token_data = response.json()
             keyyo_access_token = token_data['access_token']
             print(f"✅ Access token Keyyo récupéré: {keyyo_access_token[:20]}...")
+            
+            # Afficher toutes les infos du token
+            print(f"🔍 Debug Token complet: {json.dumps(token_data, indent=2)}")
+            
             return True
         else:
             print(f"❌ Erreur récupération token: {response.status_code} - {response.text}")
@@ -525,10 +556,12 @@ def exchange_code_for_token(auth_code):
             
     except Exception as e:
         print(f"❌ Erreur OAuth2: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def get_csi_token():
-    """Récupère le CSI token nécessaire pour CTI"""
+    """Récupère le CSI token nécessaire pour CTI avec debug amélioré"""
     global keyyo_csi_token
     
     if not keyyo_access_token:
@@ -541,38 +574,107 @@ def get_csi_token():
     }
     
     try:
+        print("🔍 Debug: Tentative récupération des services...")
+        
         # D'abord, récupérer la liste des services
         response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
+        
+        print(f"🔍 Debug: Status code services: {response.status_code}")
+        print(f"🔍 Debug: Response headers: {response.headers}")
+        print(f"🔍 Debug: Response text: {response.text}")
         
         if response.status_code == 200:
             services = response.json()
             print(f"📋 Services trouvés: {json.dumps(services, indent=2)}")
             
+            # Analyser la structure de la réponse
+            if isinstance(services, dict):
+                if 'services' in services:
+                    # Structure: {"services": {"csi1": {...}, "csi2": {...}}}
+                    services_dict = services['services']
+                elif services:
+                    # Structure: {"csi1": {...}, "csi2": {...}}
+                    services_dict = services
+                else:
+                    print("❌ Structure services vide ou inconnue")
+                    return None
+            elif isinstance(services, list):
+                # Structure: [{"csi": "...", ...}, ...]
+                print("📋 Services en liste, recherche CSI...")
+                services_dict = {}
+                for service in services:
+                    if 'csi' in service:
+                        services_dict[service['csi']] = service
+                    elif 'id' in service:
+                        services_dict[service['id']] = service
+            else:
+                print(f"❌ Type de réponse inattendu: {type(services)}")
+                return None
+            
+            print(f"🔍 Debug: Services dict: {services_dict}")
+            
             # Prendre le premier service (CSI)
-            if services and len(services) > 0:
-                csi = list(services.keys())[0]  # Premier CSI disponible
+            if services_dict and len(services_dict) > 0:
+                csi = list(services_dict.keys())[0]  # Premier CSI disponible
                 print(f"🎯 CSI sélectionné: {csi}")
                 
-                # Générer le CSI token
-                csi_response = requests.post(
+                # Essayer différentes URLs pour générer le CSI token
+                possible_urls = [
                     f'https://api.keyyo.com/1.0/services/{csi}/csi_token',
-                    headers=headers
-                )
+                    f'https://api.keyyo.com/services/{csi}/csi_token',
+                    f'https://api.keyyo.com/1.0/services/{csi}/token',
+                ]
                 
-                if csi_response.status_code == 200:
-                    csi_data = csi_response.json()
-                    keyyo_csi_token = csi_data['csi_token']
-                    print(f"✅ CSI Token généré: {keyyo_csi_token[:20]}...")
-                    return keyyo_csi_token
-                else:
-                    print(f"❌ Erreur génération CSI token: {csi_response.text}")
+                for url in possible_urls:
+                    print(f"🔍 Debug: Tentative URL: {url}")
+                    
+                    csi_response = requests.post(url, headers=headers)
+                    
+                    print(f"🔍 Debug: CSI Status: {csi_response.status_code}")
+                    print(f"🔍 Debug: CSI Response: {csi_response.text}")
+                    
+                    if csi_response.status_code == 200:
+                        try:
+                            csi_data = csi_response.json()
+                            print(f"🔍 Debug: CSI Data: {json.dumps(csi_data, indent=2)}")
+                            
+                            # Chercher le token dans différents champs possibles
+                            token_fields = ['csi_token', 'token', 'access_token', 'cti_token']
+                            
+                            for field in token_fields:
+                                if field in csi_data:
+                                    keyyo_csi_token = csi_data[field]
+                                    print(f"✅ CSI Token trouvé dans '{field}': {keyyo_csi_token[:20]}...")
+                                    return keyyo_csi_token
+                            
+                            print(f"❌ Aucun champ token trouvé dans: {list(csi_data.keys())}")
+                            
+                        except json.JSONDecodeError:
+                            print(f"❌ Réponse non-JSON: {csi_response.text}")
+                    else:
+                        print(f"❌ Erreur génération CSI token: {csi_response.status_code} - {csi_response.text}")
+                
+                print("❌ Aucune URL n'a fonctionné pour générer le CSI token")
+                return None
+                
             else:
-                print("❌ Aucun service trouvé")
+                print("❌ Aucun service trouvé dans la réponse")
+                return None
+                
+        elif response.status_code == 401:
+            print("❌ Token d'accès invalide ou expiré")
+            return None
+        elif response.status_code == 403:
+            print("❌ Permissions insuffisantes - vérifiez les scopes OAuth2")
+            return None
         else:
             print(f"❌ Erreur récupération services: {response.status_code} - {response.text}")
+            return None
             
     except Exception as e:
         print(f"❌ Erreur récupération CSI: {str(e)}")
+        import traceback
+        traceback.print_exc()
     
     return None
 
@@ -718,6 +820,127 @@ def keyyo_callback():
     else:
         return "❌ Code d'autorisation manquant", 400
 
+@app.route('/oauth/keyyo/manual', methods=['GET', 'POST'])
+def keyyo_manual_callback():
+    """Callback manuel pour debug OAuth2"""
+    if request.method == 'GET':
+        return """
+        <html>
+        <head>
+            <title>🔧 Debug OAuth2 Keyyo</title>
+            <style>
+                body { font-family: Arial; margin: 20px; }
+                .container { max-width: 600px; margin: 0 auto; }
+                input, textarea { width: 100%; padding: 10px; margin: 5px 0; }
+                .btn { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+                .debug { background: #f0f0f0; padding: 15px; margin: 10px 0; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔧 Debug OAuth2 Keyyo Manual</h1>
+                
+                <div class="debug">
+                    <h3>📋 Instructions:</h3>
+                    <ol>
+                        <li>Allez sur: <a href="/keyyo-auth" target="_blank">Démarrer OAuth2</a></li>
+                        <li>Autorisez l'application</li>
+                        <li>Copiez le <strong>code</strong> depuis l'URL de retour</li>
+                        <li>Collez-le ci-dessous</li>
+                    </ol>
+                </div>
+                
+                <form method="POST">
+                    <label><strong>🔑 Code d'autorisation:</strong></label>
+                    <textarea name="auth_code" rows="3" placeholder="Collez le code d'autorisation ici..."></textarea>
+                    
+                    <label><strong>📧 URL de callback complète (optionnel):</strong></label>
+                    <input type="text" name="callback_url" placeholder="https://web-production-95ca.up.railway.app/oauth/keyyo/callback?code=...">
+                    
+                    <br><br>
+                    <button type="submit" class="btn">🚀 Échanger contre Access Token</button>
+                </form>
+                
+                <div class="debug">
+                    <p><strong>Configuration actuelle:</strong></p>
+                    <p>Client ID: <code>{client_id}</code></p>
+                    <p>Redirect URI: <code>{redirect_uri}</code></p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """.format(
+            client_id=KEYYO_CLIENT_ID,
+            redirect_uri=KEYYO_REDIRECT_URI
+        )
+    
+    elif request.method == 'POST':
+        auth_code = request.form.get('auth_code', '').strip()
+        callback_url = request.form.get('callback_url', '').strip()
+        
+        # Extraire le code depuis l'URL si fournie
+        if callback_url and 'code=' in callback_url:
+            parsed = urlparse(callback_url)
+            params = parse_qs(parsed.query)
+            if 'code' in params:
+                auth_code = params['code'][0]
+        
+        if auth_code:
+            print(f"🔧 Test manuel OAuth2 avec code: {auth_code[:20]}...")
+            success = exchange_code_for_token(auth_code)
+            
+            if success:
+                csi_token = get_csi_token()
+                
+                if csi_token:
+                    return f"""
+                    <h2>✅ Succès OAuth2 Manuel !</h2>
+                    <p><strong>Access Token:</strong> <code>{keyyo_access_token[:20]}...</code></p>
+                    <p><strong>CSI Token:</strong> <code>{csi_token}</code></p>
+                    <a href="/keyyo-cti" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🚀 Interface CTI</a>
+                    <a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-left: 10px;">🏠 Accueil</a>
+                    """
+                else:
+                    return f"""
+                    <h2>⚠️ Access Token OK, mais erreur CSI Token</h2>
+                    <p><strong>Access Token:</strong> <code>{keyyo_access_token[:20]}...</code></p>
+                    <p>Vérifiez les logs pour voir l'erreur CSI Token</p>
+                    <a href="/debug-keyyo">🔍 Debug API</a>
+                    """
+            else:
+                return """
+                <h2>❌ Erreur échange OAuth2</h2>
+                <p>Vérifiez les logs serveur pour plus d'infos</p>
+                <a href="/oauth/keyyo/manual">🔄 Réessayer</a>
+                """
+        else:
+            return """
+            <h2>❌ Code d'autorisation manquant</h2>
+            <a href="/oauth/keyyo/manual">🔄 Retour</a>
+            """
+
+@app.route('/test-oauth-direct')
+def test_oauth_direct():
+    """Test OAuth2 avec paramètres hardcodés pour debug"""
+    
+    # Pour tester avec un code que vous récupérez manuellement
+    test_code = request.args.get('code', '')
+    
+    if test_code:
+        print(f"🧪 Test OAuth2 direct avec code: {test_code[:20]}...")
+        success = exchange_code_for_token(test_code)
+        
+        return jsonify({
+            "test": "oauth_direct",
+            "code_received": test_code[:20] + "...",
+            "exchange_success": success,
+            "access_token_available": keyyo_access_token is not None
+        })
+    else:
+        return jsonify({
+            "error": "Ajoutez ?code=VOTRE_CODE à l'URL pour tester"
+        })
+
 @app.route('/keyyo-cti')
 def keyyo_cti_interface():
     """Interface CTI Keyyo"""
@@ -771,6 +994,128 @@ def keyyo_status():
         "redirect_uri": KEYYO_REDIRECT_URI
     })
 
+@app.route('/debug-keyyo')
+def debug_keyyo():
+    """Debug manuel de l'API Keyyo"""
+    if not keyyo_access_token:
+        return jsonify({"error": "Pas d'access token. Faites d'abord /keyyo-auth"})
+    
+    headers = {
+        'Authorization': f'Bearer {keyyo_access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    debug_info = {
+        "access_token_preview": keyyo_access_token[:20] + "..." if keyyo_access_token else None,
+        "tests": []
+    }
+    
+    # Test 1: Services
+    try:
+        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
+        debug_info["tests"].append({
+            "endpoint": "/1.0/services",
+            "status_code": response.status_code,
+            "response": response.json() if response.status_code == 200 else response.text,
+            "headers": dict(response.headers)
+        })
+    except Exception as e:
+        debug_info["tests"].append({
+            "endpoint": "/1.0/services",
+            "error": str(e)
+        })
+    
+    # Test 2: Alternative services endpoint
+    try:
+        response = requests.get('https://api.keyyo.com/services', headers=headers)
+        debug_info["tests"].append({
+            "endpoint": "/services",
+            "status_code": response.status_code,
+            "response": response.json() if response.status_code == 200 else response.text,
+            "headers": dict(response.headers)
+        })
+    except Exception as e:
+        debug_info["tests"].append({
+            "endpoint": "/services",
+            "error": str(e)
+        })
+    
+    # Test 3: User info
+    try:
+        response = requests.get('https://api.keyyo.com/1.0/user', headers=headers)
+        debug_info["tests"].append({
+            "endpoint": "/1.0/user",
+            "status_code": response.status_code,
+            "response": response.json() if response.status_code == 200 else response.text
+        })
+    except Exception as e:
+        debug_info["tests"].append({
+            "endpoint": "/1.0/user",
+            "error": str(e)
+        })
+    
+    return jsonify(debug_info)
+
+@app.route('/manual-csi', methods=['GET', 'POST'])
+def manual_csi():
+    """Interface pour saisie manuelle du CSI token"""
+    global keyyo_csi_token
+    
+    if request.method == 'POST':
+        manual_token = request.form.get('csi_token', '').strip()
+        
+        if manual_token:
+            keyyo_csi_token = manual_token
+            print(f"✅ CSI Token saisi manuellement: {keyyo_csi_token[:20]}...")
+            
+            return f"""
+            <h2>✅ CSI Token configuré manuellement !</h2>
+            <p><strong>Token:</strong> <code>{keyyo_csi_token[:20]}...</code></p>
+            <a href="/keyyo-cti" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🚀 Ouvrir Interface CTI</a>
+            <a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-left: 10px;">🏠 Retour accueil</a>
+            """
+        else:
+            return "❌ Token vide", 400
+    
+    return """
+    <html>
+    <head>
+        <title>🔑 Saisie manuelle CSI Token</title>
+        <style>
+            body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }
+            input { padding: 10px; width: 100%; border: 1px solid #ddd; border-radius: 5px; margin: 10px 0; }
+            .btn { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; }
+            .info { background: #e1f5fe; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔑 Saisie manuelle CSI Token</h1>
+            
+            <div class="info">
+                <h3>📋 Comment récupérer votre CSI Token :</h3>
+                <ol>
+                    <li>Connectez-vous à votre <strong>espace client Bouygues Pro</strong></li>
+                    <li>Cherchez la section <strong>"API"</strong> ou <strong>"Développeurs"</strong></li>
+                    <li>Ou appelez le <strong>1067</strong> et demandez votre <strong>"CSI Token pour l'API CTI"</strong></li>
+                    <li>Le token ressemble à : <code>eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...</code></li>
+                </ol>
+            </div>
+            
+            <form method="POST">
+                <label><strong>🔑 CSI Token :</strong></label>
+                <input type="text" name="csi_token" placeholder="Collez votre CSI token ici..." required>
+                <br>
+                <button type="submit" class="btn">✅ Configurer Token</button>
+            </form>
+            
+            <p><a href="/">🏠 Retour accueil</a></p>
+        </div>
+    </body>
+    </html>
+    """
+
 # =================== ROUTES PRINCIPALES ===================
 
 @app.route('/')
@@ -794,6 +1139,7 @@ def home():
         .btn-danger { background: #f44336; }
         .btn-success { background: #4CAF50; }
         .btn-keyyo { background: #ff9800; }
+        .btn-manual { background: #9c27b0; }
         .links { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
         .success { color: #4CAF50; font-weight: bold; }
         .error { color: #f44336; font-weight: bold; }
@@ -838,6 +1184,8 @@ def home():
                 <h3>🎯 Intégration CTI temps réel :</h3>
                 <ol>
                     <li>🔐 <strong>Authentifiez-vous</strong> : <a href="/keyyo-auth" style="color: #4CAF50; font-weight: bold;">Démarrer OAuth2 Keyyo</a></li>
+                    <li>🔧 <strong>Debug manuel</strong> : <a href="/oauth/keyyo/manual" style="color: #9c27b0; font-weight: bold;">Test OAuth2 Manuel</a></li>
+                    <li>🔑 <strong>Saisie manuelle</strong> : <a href="/manual-csi" style="color: #ff9800; font-weight: bold;">CSI Token Manuel</a></li>
                     <li>📊 <strong>Vérifiez le statut</strong> : <a href="/keyyo-status" style="color: #2196F3;">Status intégration</a></li>
                     <li>🚀 <strong>Interface CTI</strong> : <a href="/keyyo-cti" style="color: #ff9800;">Ouvrir supervision</a></li>
                     <li>✅ <strong>Test complet</strong> : Appelez votre numéro et vérifiez Telegram</li>
@@ -846,8 +1194,11 @@ def home():
             
             <div class="links">
                 <a href="/keyyo-auth" class="btn btn-success">🔐 Auth Keyyo OAuth2</a>
+                <a href="/oauth/keyyo/manual" class="btn btn-manual">🔧 Debug Manuel</a>
+                <a href="/manual-csi" class="btn btn-keyyo">🔑 CSI Token Manuel</a>
                 <a href="/keyyo-status" class="btn">📊 Status Keyyo</a>
                 <a href="/keyyo-cti" class="btn btn-keyyo">🚀 Interface CTI</a>
+                <a href="/debug-keyyo" class="btn">🔍 Debug API</a>
             </div>
         </div>
 
@@ -1164,8 +1515,6 @@ def test_iban():
 @app.route('/test-ovh-cgi')
 def test_ovh_cgi():
     """Test du webhook OVH format CGI"""
-    from urllib.parse import urlencode
-    
     # Test avec un client existant s'il y en a
     if clients_database:
         test_caller = list(clients_database.keys())[0]
