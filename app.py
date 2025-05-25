@@ -4,8 +4,10 @@ import json
 import requests
 import csv
 import io
+import base64
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 app.secret_key = 'webhook-ovh-secret-key'
@@ -13,6 +15,15 @@ app.secret_key = 'webhook-ovh-secret-key'
 # Configuration Telegram
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '7822148813:AAEhWJWToLUY5heVP1G_yqM1Io-vmAMlbLg')
 CHAT_ID = os.environ.get('CHAT_ID', '-1002652961145')
+
+# Configuration OAuth2 Keyyo
+KEYYO_CLIENT_ID = os.environ.get('KEYYO_CLIENT_ID', '6832980609dd1')
+KEYYO_CLIENT_SECRET = os.environ.get('KEYYO_CLIENT_SECRET', '3ce3ff3d62c261c079b66e9a')
+KEYYO_REDIRECT_URI = 'https://web-production-95ca.up.railway.app/oauth/keyyo/callback'
+
+# Variables globales pour Keyyo
+keyyo_access_token = None
+keyyo_csi_token = None
 
 # Base de données clients en mémoire
 clients_database = {}
@@ -427,6 +438,7 @@ def process_telegram_command(message_text, chat_id):
 📁 Dernier upload: {upload_stats['last_upload'] or 'Aucun'}
 📋 Fichier: {upload_stats['filename'] or 'Aucun'}
 🏦 Banques auto-détectées: {auto_detected}
+🚀 CTI Keyyo: {'✅ Configuré' if keyyo_csi_token else '❌ Non configuré'}
 
 📞 <b>APPELS DU JOUR</b>
 ▪️ Clients appelants: {len([c for c in clients_database.values() if c['dernier_appel'] and c['dernier_appel'].startswith(datetime.now().strftime('%d/%m/%Y'))])}
@@ -453,6 +465,7 @@ def process_telegram_command(message_text, chat_id):
 
 ✅ <b>Le bot reçoit automatiquement:</b>
 ▪️ Les appels entrants OVH
+▪️ Les appels entrants Keyyo CTI (temps réel)
 ▪️ Les notifications en temps réel
 ▪️ 🌐 Détection automatique des banques via APIs IBAN
             """
@@ -465,6 +478,124 @@ def process_telegram_command(message_text, chat_id):
     except Exception as e:
         print(f"❌ Erreur commande Telegram: {str(e)}")
         return {"error": str(e)}
+
+# =================== FONCTIONS OAUTH2 KEYYO ===================
+
+def get_keyyo_auth_url():
+    """Génère l'URL d'autorisation OAuth2 Keyyo"""
+    auth_params = {
+        'response_type': 'code',
+        'client_id': KEYYO_CLIENT_ID,
+        'redirect_uri': KEYYO_REDIRECT_URI,
+        'scope': 'cti_admin full_access_read_only',
+        'state': 'webhook_telegram_cti'
+    }
+    
+    return f"https://ssl.keyyo.com/oauth2/authorize.php?{urlencode(auth_params)}"
+
+def exchange_code_for_token(auth_code):
+    """Échange le code d'autorisation contre un access token"""
+    global keyyo_access_token
+    
+    # Préparer les credentials
+    credentials = base64.b64encode(f"{KEYYO_CLIENT_ID}:{KEYYO_CLIENT_SECRET}".encode()).decode()
+    
+    headers = {
+        'Authorization': f'Basic {credentials}',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    
+    data = {
+        'grant_type': 'authorization_code',
+        'code': auth_code,
+        'redirect_uri': KEYYO_REDIRECT_URI
+    }
+    
+    try:
+        response = requests.post('https://api.keyyo.com/oauth2/token.php', headers=headers, data=data)
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            keyyo_access_token = token_data['access_token']
+            print(f"✅ Access token Keyyo récupéré: {keyyo_access_token[:20]}...")
+            return True
+        else:
+            print(f"❌ Erreur récupération token: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Erreur OAuth2: {str(e)}")
+        return False
+
+def get_csi_token():
+    """Récupère le CSI token nécessaire pour CTI"""
+    global keyyo_csi_token
+    
+    if not keyyo_access_token:
+        print("❌ Pas d'access token disponible")
+        return None
+    
+    headers = {
+        'Authorization': f'Bearer {keyyo_access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        # D'abord, récupérer la liste des services
+        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
+        
+        if response.status_code == 200:
+            services = response.json()
+            print(f"📋 Services trouvés: {json.dumps(services, indent=2)}")
+            
+            # Prendre le premier service (CSI)
+            if services and len(services) > 0:
+                csi = list(services.keys())[0]  # Premier CSI disponible
+                print(f"🎯 CSI sélectionné: {csi}")
+                
+                # Générer le CSI token
+                csi_response = requests.post(
+                    f'https://api.keyyo.com/1.0/services/{csi}/csi_token',
+                    headers=headers
+                )
+                
+                if csi_response.status_code == 200:
+                    csi_data = csi_response.json()
+                    keyyo_csi_token = csi_data['csi_token']
+                    print(f"✅ CSI Token généré: {keyyo_csi_token[:20]}...")
+                    return keyyo_csi_token
+                else:
+                    print(f"❌ Erreur génération CSI token: {csi_response.text}")
+            else:
+                print("❌ Aucun service trouvé")
+        else:
+            print(f"❌ Erreur récupération services: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Erreur récupération CSI: {str(e)}")
+    
+    return None
+
+def test_keyyo_api():
+    """Test de l'API Keyyo avec le token actuel"""
+    if not keyyo_access_token:
+        return {"error": "Pas d'access token"}
+    
+    headers = {
+        'Authorization': f'Bearer {keyyo_access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.get('https://api.keyyo.com/1.0/services', headers=headers)
+        return {
+            "status_code": response.status_code,
+            "response": response.json() if response.status_code == 200 else response.text
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# =================== ROUTES WEBHOOK ===================
 
 @app.route('/webhook/ovh', methods=['POST', 'GET'])
 def ovh_webhook():
@@ -496,6 +627,7 @@ def ovh_webhook():
         # Message Telegram formaté
         telegram_message = format_client_message(client_info, context="appel")
         telegram_message += f"\n📊 Statut appel: {call_status}"
+        telegram_message += f"\n🔗 Source: {'OVH' if 'CGI' in call_status else 'Keyyo CTI'}"
         
         # Envoi vers Telegram
         telegram_result = send_telegram_message(telegram_message)
@@ -513,7 +645,8 @@ def ovh_webhook():
             "telegram_sent": telegram_result is not None,
             "client": f"{client_info['prenom']} {client_info['nom']}",
             "client_status": client_info['statut'],
-            "bank_detected": client_info.get('banque', 'N/A') not in ['N/A', '']
+            "bank_detected": client_info.get('banque', 'N/A') not in ['N/A', ''],
+            "source": "OVH-CGI" if request.method == 'GET' else "Keyyo-CTI"
         })
         
     except Exception as e:
@@ -547,6 +680,99 @@ def telegram_webhook():
         print(f"❌ Erreur webhook Telegram: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+# =================== ROUTES OAUTH2 KEYYO ===================
+
+@app.route('/keyyo-auth')
+def keyyo_auth():
+    """Démarre le processus d'authentification OAuth2"""
+    auth_url = get_keyyo_auth_url()
+    return redirect(auth_url)
+
+@app.route('/oauth/keyyo/callback')
+def keyyo_callback():
+    """Callback OAuth2 Keyyo"""
+    auth_code = request.args.get('code')
+    error = request.args.get('error')
+    
+    if error:
+        return f"❌ Erreur OAuth2: {error}", 400
+    
+    if auth_code:
+        success = exchange_code_for_token(auth_code)
+        
+        if success:
+            csi_token = get_csi_token()
+            
+            if csi_token:
+                return f"""
+                <h2>✅ Authentification Keyyo réussie !</h2>
+                <p><strong>CSI Token:</strong> <code>{csi_token}</code></p>
+                <p>Copiez ce token dans votre interface CTI</p>
+                <a href="/keyyo-cti" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🚀 Ouvrir Interface CTI</a>
+                <a href="/" style="background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-left: 10px;">🏠 Retour accueil</a>
+                """
+            else:
+                return "❌ Erreur génération CSI token", 500
+        else:
+            return "❌ Erreur échange token", 500
+    else:
+        return "❌ Code d'autorisation manquant", 400
+
+@app.route('/keyyo-cti')
+def keyyo_cti_interface():
+    """Interface CTI Keyyo"""
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🚀 Interface CTI Keyyo</title>
+        <meta charset="UTF-8">
+        <style>
+            body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }
+            .success { background: #e8f5e8; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #4CAF50; }
+            .btn { background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 5px; display: inline-block; }
+            .btn.success { background: #4CAF50; }
+            code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 Interface CTI Keyyo</h1>
+            <p>Votre CSI Token: <strong><code>{{ csi_token }}</code></strong></p>
+            
+            <div class="success">
+                <h3>✅ Prochaines étapes:</h3>
+                <ol>
+                    <li>Copiez le CSI token ci-dessus</li>
+                    <li>Ouvrez l'interface CTI dans un nouvel onglet</li>
+                    <li>Collez le token et connectez-vous</li>
+                    <li>Les appels seront automatiquement envoyés à Telegram!</li>
+                </ol>
+            </div>
+            
+            <a href="https://keyyo-cti-interface.up.railway.app" target="_blank" class="btn success">🚀 Ouvrir Interface CTI</a>
+            <a href="/keyyo-status" class="btn">📊 Status Keyyo</a>
+            <a href="/" class="btn">🏠 Retour accueil</a>
+        </div>
+    </body>
+    </html>
+    """, csi_token=keyyo_csi_token or 'Non disponible')
+
+@app.route('/keyyo-status')
+def keyyo_status():
+    """Status de l'intégration Keyyo"""
+    return jsonify({
+        "access_token_available": keyyo_access_token is not None,
+        "csi_token_available": keyyo_csi_token is not None,
+        "csi_token_preview": keyyo_csi_token[:20] + "..." if keyyo_csi_token else None,
+        "auth_url": get_keyyo_auth_url(),
+        "client_id": KEYYO_CLIENT_ID,
+        "redirect_uri": KEYYO_REDIRECT_URI
+    })
+
+# =================== ROUTES PRINCIPALES ===================
+
 @app.route('/')
 def home():
     return render_template_string("""
@@ -567,21 +793,23 @@ def home():
         .btn:hover { background: #1976D2; }
         .btn-danger { background: #f44336; }
         .btn-success { background: #4CAF50; }
+        .btn-keyyo { background: #ff9800; }
         .links { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
         .success { color: #4CAF50; font-weight: bold; }
         .error { color: #f44336; font-weight: bold; }
         code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
         .info-box { background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 10px 0; }
         .new-feature { background: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 10px 0; }
+        .keyyo-section { background: #e1f5fe; border-left: 4px solid #4CAF50; padding: 15px; margin: 20px 0; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 Webhook OVH-Telegram</h1>
+            <h1>🤖 Webhook OVH-Telegram + 🚀 CTI Keyyo</h1>
             <p class="success">✅ Serveur Railway actif 24/7 - Bot configuré</p>
             <div class="new-feature">
-                <strong>🆕 NOUVELLE FONCTIONNALITÉ :</strong> 🌐 Détection automatique de la banque via APIs IBAN externes !
+                <strong>🆕 NOUVELLE FONCTIONNALITÉ :</strong> 🚀 Intégration CTI Keyyo temps réel + 🌐 Détection automatique banques IBAN !
             </div>
         </div>
 
@@ -597,6 +825,29 @@ def home():
             <div class="stat-card">
                 <h3>📋 Fichier actuel</h3>
                 <p>{{ filename or 'Aucun' }}</p>
+            </div>
+            <div class="stat-card">
+                <h3>🚀 CTI Keyyo</h3>
+                <p>{{ 'Configuré' if csi_available else 'À configurer' }}</p>
+            </div>
+        </div>
+
+        <div class="keyyo-section">
+            <h2>🚀 Configuration Keyyo CTI</h2>
+            <div class="info-box">
+                <h3>🎯 Intégration CTI temps réel :</h3>
+                <ol>
+                    <li>🔐 <strong>Authentifiez-vous</strong> : <a href="/keyyo-auth" style="color: #4CAF50; font-weight: bold;">Démarrer OAuth2 Keyyo</a></li>
+                    <li>📊 <strong>Vérifiez le statut</strong> : <a href="/keyyo-status" style="color: #2196F3;">Status intégration</a></li>
+                    <li>🚀 <strong>Interface CTI</strong> : <a href="/keyyo-cti" style="color: #ff9800;">Ouvrir supervision</a></li>
+                    <li>✅ <strong>Test complet</strong> : Appelez votre numéro et vérifiez Telegram</li>
+                </ol>
+            </div>
+            
+            <div class="links">
+                <a href="/keyyo-auth" class="btn btn-success">🔐 Auth Keyyo OAuth2</a>
+                <a href="/keyyo-status" class="btn">📊 Status Keyyo</a>
+                <a href="/keyyo-cti" class="btn btn-keyyo">🚀 Interface CTI</a>
             </div>
         </div>
 
@@ -645,7 +896,7 @@ def home():
         <ul>
             <li><code>/numero 0123456789</code> - Affiche fiche client complète</li>
             <li><code>/iban FR76XXXXXXXXX</code> - <span class="new-feature" style="display: inline; background: #fff3e0; padding: 2px 6px;">🆕 Détecte la banque depuis l'IBAN</span></li>
-            <li><code>/stats</code> - Statistiques de la campagne</li>
+            <li><code>/stats</code> - Statistiques de la campagne + status CTI Keyyo</li>
             <li><code>/help</code> - Aide et liste des commandes</li>
         </ul>
 
@@ -654,7 +905,8 @@ def home():
             <ol>
                 <li>📂 Uploadez votre fichier CSV avec les clients</li>
                 <li>🌐 Les banques sont automatiquement détectées via APIs IBAN externes</li>
-                <li>📞 Configurez l'URL OVH CTI</li>
+                <li>🚀 Configurez l'authentification Keyyo CTI pour les appels temps réel</li>
+                <li>📞 Configurez l'URL OVH CTI en backup</li>
                 <li>✅ Chaque appel entrant affiche automatiquement la fiche client dans Telegram</li>
                 <li>🔍 Utilisez <code>/numero XXXXXXXXXX</code> pour rechercher un client</li>
                 <li>🆕 Utilisez <code>/iban FR76XXXXX</code> pour tester la détection de banque</li>
@@ -666,7 +918,8 @@ def home():
     """, 
     total_clients=upload_stats["total_clients"],
     last_upload=upload_stats["last_upload"],
-    filename=upload_stats["filename"]
+    filename=upload_stats["filename"],
+    csi_available=keyyo_csi_token is not None
     )
 
 @app.route('/upload', methods=['POST'])
@@ -937,10 +1190,13 @@ def test_ovh_cgi():
 def health():
     return jsonify({
         "status": "healthy", 
-        "service": "webhook-ovh-telegram",
+        "service": "webhook-ovh-telegram-keyyo",
         "telegram_configured": bool(TELEGRAM_TOKEN and CHAT_ID),
         "clients_loaded": upload_stats["total_clients"],
         "iban_detection": "API-enabled with fallback",
+        "keyyo_oauth_configured": bool(KEYYO_CLIENT_ID and KEYYO_CLIENT_SECRET),
+        "keyyo_authenticated": keyyo_access_token is not None,
+        "keyyo_cti_ready": keyyo_csi_token is not None,
         "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     })
 
