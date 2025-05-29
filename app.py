@@ -34,7 +34,7 @@ app.secret_key = 'webhook-ovh-secret-key'
 class Config:
     # Telegram
     TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '7822148813:AAEhWJWToLUY5heVP1G_yqM1Io-vmAMlbLg')
-    CHAT_ID = os.environ.get('CHAT_ID', '-1002652961145')
+    CHAT_ID = os.environ.get('CHAT_ID', '-1002567065407')
     
     # Keyyo OAuth2
     KEYYO_CLIENT_ID = os.environ.get('KEYYO_CLIENT_ID', '6832980609dd1')
